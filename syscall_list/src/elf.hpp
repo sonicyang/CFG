@@ -116,34 +116,60 @@ struct ELF {
         }
 
         /* Parse GOT entries */
+        /* Only if it is in the rela.dyn table and not in any seciton is considered a GOT symbol */
         spdlog::info("Gathering GOT infos...");
         std::vector<Dyninst::SymtabAPI::Symbol*> syms;
         symtab->getAllSymbols(syms);
         for (const auto& sym : syms) {
+            const auto symbol_name = sym->getMangledName();
+            // XXX: get version name of symbol, Not a problem for now though
+
             if (sym->getLinkage() == Dyninst::SymtabAPI::Symbol::SymbolLinkage::SL_GLOBAL &&
                 sym->getType() == Dyninst::SymtabAPI::Symbol::SymbolType::ST_FUNCTION &&  // isFunction won't work
                 sym->isInDynSymtab()){
 
-                const auto symbol_name = sym->getMangledName();
+                // In one of our sections?
+                if (sym->getRegion() != nullptr) {  // Yes
+                    if (rela_table.contains(symbol_name)) {
+                        if (seen.contains(DynamicSymbol{name, symbol_name})) {
+                            continue;
+                        }
 
-                std::string fname;
-                if (!sym->getVersionFileName(fname)) {
-                    spdlog::error("Failed to find target file of relocation of {}", symbol_name);
-                    continue;
-                }
-
-                if (!rela_table.contains(symbol_name)) {
-                    if (!seen.contains(DynamicSymbol{fname, symbol_name})) {
-                        spdlog::error("Failed to resolve address of relocation of {}", symbol_name);
+                        /* Also link the relocation */
+                        const auto addr_src = rela_table[symbol_name];
+                        spdlog::debug("Resolving {} {} @ {:x}", name, symbol_name, addr_src);
+                        this->GOT.emplace(addr_src, DynamicSymbol{name, symbol_name});
                     }
-                    continue;
+
+
+                    const auto addr_dst = sym->getOffset();
+                    spdlog::debug("Resolving {} {} @ {:x}", name, symbol_name, addr_dst);
+
+                    this->GOT.emplace(addr_dst, DynamicSymbol{name, symbol_name});
+
+                    /* It is out function in disguise, parse it */
+                    object->parse(addr_dst, true);
+                    object->finalize();
+                } else {  // No
+                    std::string fname;
+                    if (!sym->getVersionFileName(fname)) {
+                        spdlog::error("Failed to find target file of relocation of {} {}", symbol_name, sym->getIndex());
+                        continue;
+                    }
+
+                    if (!rela_table.contains(symbol_name)) {
+                        if (!seen.contains(DynamicSymbol{fname, symbol_name})) {
+                            spdlog::error("Failed to resolve address of relocation of {}", symbol_name);
+                        }
+                        continue;
+                    }
+
+                    const auto addr = rela_table[symbol_name];
+
+                    spdlog::debug("Resolving {} {} @ {:x}", fname, symbol_name, addr);
+
+                    this->GOT.emplace(addr, DynamicSymbol{fname, symbol_name});
                 }
-
-                const auto addr = rela_table[symbol_name];
-
-                spdlog::debug("Resolving {} @ {:x}", symbol_name, addr);
-
-                this->GOT.emplace(addr, DynamicSymbol{fname, symbol_name});
             }
         }
 
@@ -158,15 +184,26 @@ struct ELF {
         /* Populate the function and CFG entries */
         for (const auto& func : object->funcs()) {
             const auto name = func->name();
+            const auto addr = func->addr();
 
-            spdlog::debug("Find Func {}", name);
+            spdlog::debug("Find Func {} @ {:x}", name, addr);
 
             this->functions.emplace(func);
             this->function_name_map.emplace(name, func);
 
+            /* Hacks to handle Weak symbols causing name aliasing */
+            if (this->PLT.contains(addr)) {
+                this->function_name_map.emplace(this->PLT[addr].symbol, func);
+            }
+
+            if (this->GOT.contains(addr)) {
+                this->function_name_map.emplace(this->GOT[addr].symbol, func);
+            }
+
             for (const auto& bb : func->blocks()) {
                 for (const auto& target : bb->targets()) {
                     if (target->interproc()) {
+                        // Possible calling a GOT using indirect call
                         // Ignore PLTs and RET
                         if (target->sinkEdge() &&
                             !this->PLT.contains(bb->last()) &&
@@ -187,8 +224,26 @@ struct ELF {
                                     const auto pc = bb->end();  // Account for the instruction size, RIP pointing the next instruction!
                                     const auto addr_str = match[1].str();
                                     const auto addr = std::stoul(addr_str, nullptr, 16) + pc;  // pc relative addressing
-                                    spdlog::debug("{:x} resolve as a edge to {:x}", out_addr, addr);
+                                    spdlog::debug("{:x} {} resolve as a edge to {:x}", out_addr, instr.format(), addr);
                                     this->cfg[func].external.emplace(addr);
+
+                                    //std::set<Dyninst::ParseAPI::Function*> callees;
+                                    //this->object->findFuncs(func->region(), addr, callees);
+                                    //spdlog::info("{} {} {:x} - {:x}   {}", this->PLT.contains(addr), this->GOT.contains(addr), func->region()->low(), func->region()->high(), callees.size());
+                                    //for (const auto& callee : callees) {
+                                        //spdlog::info("    {} @ {:x}", callee->name(), callee->addr());
+                                    //}
+
+
+                                    //if (callee->name() == func->name() && callee->addr() == func->addr()) {
+                                        //continue;  // prevent recursive call
+                                    //} else if (this->PLT.contains(callee->addr())) {
+                                        //this->cfg[func].external.emplace(callee->addr());
+                                    //} else if (this->GOT.contains(callee->addr())) {
+                                        //this->cfg[func].external.emplace(callee->addr());
+                                    //} else {
+                                        //this->cfg[func].internal.emplace(addr);
+                                    //}
                                 } else {
                                     spdlog::warn("Failed to decode edge {:x}: {}", out_addr, instr.format());
                                 }
@@ -199,8 +254,13 @@ struct ELF {
                             for (auto& callee : callees) {
                                 if (callee->name() == func->name() && callee->addr() == func->addr()) {
                                     continue;  // prevent recursive call
+                                } else if (this->PLT.contains(callee->addr())) {
+                                    this->cfg[func].external.emplace(callee->addr());
+                                } else if (this->GOT.contains(callee->addr())) {
+                                    this->cfg[func].external.emplace(callee->addr());
+                                } else {
+                                    this->cfg[func].internal.emplace(callee);
                                 }
-                                this->cfg[func].internal.emplace(callee);
                             }
                         }
                     }
@@ -208,10 +268,10 @@ struct ELF {
             }
         }
 
-        /* Recursively resolve any external libraries */
+        /* Recursively resolve any external libraries, avoid recursive to our self */
         for (const auto& [addr, entry] : GOT) {
             const auto [obj, symbol] = entry;
-            if (!ELFCache.contains(obj)) {
+            if (!ELFCache.contains(obj) && obj != this->name) {
                 const auto path = findLib(obj);
                 ELFCache.emplace(obj, ELF(path, obj, modules));
             }
@@ -219,7 +279,7 @@ struct ELF {
 
         for (const auto& [addr, entry] : PLT) {
             const auto [obj, symbol] = entry;
-            if (!ELFCache.contains(obj)) {
+            if (!ELFCache.contains(obj) && obj != this->name) {
                 const auto path = findLib(obj);
                 ELFCache.emplace(obj, ELF(path, obj, modules));
             }
