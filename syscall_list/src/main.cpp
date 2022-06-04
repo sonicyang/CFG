@@ -32,22 +32,27 @@ namespace InstructionAPI = Dyninst::InstructionAPI;
 
 BPatch bp;
 
-static inline void traverse(const auto& object, const auto& symbol, std::set<ELF::DynamicSymbol>& seen, const int layer = 0) {
+static inline void traverse(const auto& object, const auto& symbol, std::set<std::pair<std::string, Dyninst::Address>>& seen, const int layer = 0) {
     const auto& elf = ELFCache.at(object);
     const auto& func = [&] {
         if constexpr (std::is_same_v<ParseAPI::Function*, std::decay_t<decltype(symbol)>>) {
             return symbol;
+        } else if constexpr (std::is_same_v<std::set<std::string>, std::decay_t<decltype(symbol)>>) {
+            const auto rsymbol = *symbol.cbegin();
+            return elf.function_name_map.at(rsymbol);
         } else {
             return elf.function_name_map.at(symbol);
         }
     }();
 
     // Prevent Loop
-    const auto this_symbol = ELF::DynamicSymbol{object, func->name()};
-    if (seen.contains(this_symbol)) {
+    // XXX: Actually, an absolute DFS is not required, because we only want to know the syscalls used
+    // all calls can share a single seen table
+    const auto current = std::make_pair(object, func->addr());
+    if (seen.contains(current)) {
         return;
     }
-    seen.emplace(this_symbol);
+    seen.emplace(current);
 
     spdlog::info("{3: <{4}}{0} {1} {2}", object, func->name(), func->addr(), "", layer);
 
@@ -55,16 +60,16 @@ static inline void traverse(const auto& object, const auto& symbol, std::set<ELF
         return;  // Don't call anything
     }
 
-    for (const auto& callee : elf.cfg.at(func).internal) {
+    for (const auto& callee : elf.cfg.at(func).static_) {
         traverse(object, callee, seen, layer + 1);
     }
-    for (const auto& addr : elf.cfg.at(func).external) {
+    for (const auto& addr : elf.cfg.at(func).dynamic) {
         if (elf.GOT.contains(addr)) {
             const auto callee = elf.GOT.at(addr);
-            traverse(callee.object, callee.symbol, seen, layer + 1);
+            traverse(callee.object, callee.symbols, seen, layer + 1);
         } else if (elf.PLT.contains(addr)) {
             const auto callee = elf.PLT.at(addr);
-            traverse(callee.object, callee.symbol, seen, layer + 1);
+            traverse(callee.object, callee.symbols, seen, layer + 1);
         } else {
             spdlog::info("{2: <{3}}Bogus call {0} {1:x}", object, addr, "", layer + 1);
         }
@@ -96,8 +101,8 @@ int main(const int argc, const char *argv[]) {
     ELFCache.emplace(exe_name, ELF(exe_path, exe_name, *image->getModules()));
 
     /* Entry point, assume as _start */
-    const auto entry_name = "_start";
+    constexpr auto entry_name = "main";
 
-    std::set<ELF::DynamicSymbol> seen;
+    std::set<std::pair<std::string, Dyninst::Address>> seen;
     traverse(exe_name, entry_name, seen);
 }
