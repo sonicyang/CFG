@@ -32,7 +32,7 @@ namespace InstructionAPI = Dyninst::InstructionAPI;
 
 BPatch bp;
 
-static inline void traverse(const auto& object, const auto& symbol, std::set<std::pair<std::string, Dyninst::Address>>& seen, const int layer = 0) {
+static inline void traverse(const auto& object, const auto& symbol, std::set<std::pair<std::string, Dyninst::Address>>& seen, const int layer) {
     const auto& elf = ELFCache.at(object);
     const auto& func = [&] {
         if constexpr (std::is_same_v<ParseAPI::Function*, std::decay_t<decltype(symbol)>>) {
@@ -46,8 +46,6 @@ static inline void traverse(const auto& object, const auto& symbol, std::set<std
     }();
 
     // Prevent Loop
-    // XXX: Actually, an absolute DFS is not required, because we only want to know the syscalls used
-    // all calls can share a single seen table
     const auto current = std::make_pair(object, func->addr());
     if (seen.contains(current)) {
         return;
@@ -74,6 +72,11 @@ static inline void traverse(const auto& object, const auto& symbol, std::set<std
             spdlog::info("{2: <{3}}Bogus call {0} {1:x}", object, addr, "", layer + 1);
         }
     }
+}
+
+static inline void traverse(const auto& object, const auto& symbol) {
+    std::set<std::pair<std::string, Dyninst::Address>> seen;
+    traverse(object, symbol, seen, 0);
 }
 
 int main(const int argc, const char *argv[]) {
@@ -103,6 +106,5 @@ int main(const int argc, const char *argv[]) {
     /* Entry point, assume as _start */
     constexpr auto entry_name = "main";
 
-    std::set<std::pair<std::string, Dyninst::Address>> seen;
-    traverse(exe_name, entry_name, seen);
+    traverse(exe_name, entry_name);
 }
