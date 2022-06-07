@@ -42,11 +42,11 @@ struct ELF {
 
     std::map<Dyninst::ParseAPI::Function*, CallDest> cfg;
 
-    std::shared_ptr<Dyninst::ParseAPI::SymtabCodeSource> source;
-    std::shared_ptr<Dyninst::ParseAPI::CodeObject> object;
-
     std::string name;
     std::string path;
+
+    std::shared_ptr<Dyninst::ParseAPI::SymtabCodeSource> source;
+    std::shared_ptr<Dyninst::ParseAPI::CodeObject> object;
 
     ELF() {};
     ELF(const ELF&) = default;
@@ -100,7 +100,7 @@ struct ELF {
             const auto addr = fbt_entry.target_addr();
             const auto symbol_name = fbt_entry.name();
 
-            spdlog::debug("Resolving {} @ {:x}", symbol_name, addr);
+            spdlog::debug("PLT Resolving {} @ {:x}", symbol_name, addr);
 
             object->parse(addr, true);
 
@@ -118,67 +118,82 @@ struct ELF {
         object->finalize();
 
         /* DynInst is a TARD, cannot let use parse GOT easily */
-        std::map<std::string, Dyninst::Address> rela_table;
+        std::map<std::string, Dyninst::Address> rela_dyn_table;
+        std::map<Dyninst::Address, Dyninst::Address> rela_plt_table;
+        const auto process_reloations = [&](const auto relocations) {
+            for (const auto& relocation : relocations) {
+                // XXX: For x86-64,
+                if (relocation.getRelType() == 8) {  // ignore R_X86_64_RELATIVE
+                    continue;
+                } else if (relocation.getRelType() == 37) {  // ignore R_X86_64_IRELATIVE is a address alias
+                    spdlog::debug("PLT.GOT sym {:x} @ {:x}", relocation.addend(), relocation.rel_addr());
+                    rela_plt_table.emplace(relocation.rel_addr(), relocation.addend());
+                } else {  // Treat other as calling a symbol with name
+                    spdlog::debug("DYN sym {} @ {:x}", relocation.name(), relocation.rel_addr());
+                    rela_dyn_table.emplace(relocation.name(), relocation.rel_addr());
+                }
+            }
+        };
         {
             Dyninst::SymtabAPI::Region* rela_region;
             if (symtab->findRegion(rela_region, ".rela.dyn")) {
-                for (const auto& relocation : rela_region->getRelocations()) {
-                    rela_table.emplace(relocation.name(), relocation.rel_addr());
-                }
+                process_reloations(rela_region->getRelocations());
             } else {
                 spdlog::error("Failed to find .rela.dyn section, might fail to resolve GOT");
+            }
+        }
+        {
+            Dyninst::SymtabAPI::Region* rela_region;
+            if (symtab->findRegion(rela_region, ".rela.plt")) {
+                process_reloations(rela_region->getRelocations());
+            } else {
+                spdlog::error("Failed to find .rela.plt section, might fail to resolve PLT.GOT");
             }
         }
 
         /* Parse GOT entries */
         /* Only if it is in the rela.dyn table and not in any seciton is considered a GOT symbol */
-        spdlog::info("Gathering GOT infos...");
+        spdlog::debug("Gathering GOT infos...");
         std::vector<Dyninst::SymtabAPI::Symbol*> syms;
         symtab->getAllSymbols(syms);
         for (const auto& sym : syms) {
             const auto symbol_name = sym->getMangledName();
             // XXX: get version name of symbol, Not a problem for now though
 
-            if (sym->getLinkage() == Dyninst::SymtabAPI::Symbol::SymbolLinkage::SL_GLOBAL &&
-                sym->getType() == Dyninst::SymtabAPI::Symbol::SymbolType::ST_FUNCTION &&  // isFunction won't work
-                sym->isInDynSymtab()){
-
-                // In one of our sections?
-                if (sym->getRegion() != nullptr) {  // Yes
-                    if (rela_table.contains(symbol_name)) {
-                        /* Also link the relocation */
-                        const auto addr_src = rela_table[symbol_name];
-                        spdlog::info("Resolving {} {} @ {:x}", name, symbol_name, addr_src);
-                        add_dynamic_entry(this->GOT, addr_src, name, symbol_name);
-                    }
-
-
-                    const auto addr_dst = sym->getOffset();
-                    spdlog::info("Resolving {} {} @ {:x}", name, symbol_name, addr_dst);
-                    add_dynamic_entry(this->GOT, addr_dst, name, symbol_name);
-
-                    /* It is our function in disguise, parse it */
-                    object->parse(addr_dst, true);
-                } else {  // No
-                    std::string fname;
-                    if (!sym->getVersionFileName(fname)) {
-                        spdlog::error("Failed to find target file of relocation of {} {}", symbol_name, sym->getIndex());
-                        continue;
-                    }
-
-                    if (!rela_table.contains(symbol_name)) {
-                        if (!seen.contains(std::make_pair(fname, symbol_name))) {
-                            spdlog::error("Failed to resolve address of relocation of {}", symbol_name);
-                        }
-                        continue;
-                    }
-
-                    const auto addr = rela_table[symbol_name];
-
-                    spdlog::info("Resolving {} {} @ {:x}", fname, symbol_name, addr);
-
-                    add_dynamic_entry(this->GOT, addr, fname, symbol_name);
+            spdlog::debug("GOT Symbol {} {} @ {:x}", name, symbol_name, sym->getOffset());
+            // In one of our sections?
+            if (sym->getRegion() != nullptr) {  // Yes
+                if (rela_dyn_table.contains(symbol_name)) {
+                    /* Also link the relocation */
+                    const auto addr_src = rela_dyn_table[symbol_name];
+                    spdlog::debug("DYN SRC Resolving {} {} @ {:x}", name, symbol_name, addr_src);
+                    add_dynamic_entry(this->GOT, addr_src, name, symbol_name);
                 }
+
+
+                const auto addr_dst = sym->getOffset();
+                spdlog::debug("DYN DST Resolving {} {} @ {:x}", name, symbol_name, addr_dst);
+                add_dynamic_entry(this->GOT, addr_dst, name, symbol_name);
+
+                /* It is our function in disguise, parse it */
+                object->parse(addr_dst, true);
+            } else {  // No
+                std::string fname;
+                if (!sym->getVersionFileName(fname)) {
+                    spdlog::error("Failed to find target file of relocation of {} {}", symbol_name, sym->getIndex());
+                    continue;
+                }
+
+                if (!rela_dyn_table.contains(symbol_name)) {
+                    if (!seen.contains(std::make_pair(fname, symbol_name))) {
+                        spdlog::error("Failed to resolve address of relocation of {}", symbol_name);
+                    }
+                    continue;
+                }
+
+                const auto addr = rela_dyn_table[symbol_name];
+                spdlog::debug("REMOTE Resolving {} {} @ {:x}", fname, symbol_name, addr);
+                add_dynamic_entry(this->GOT, addr, fname, symbol_name);
             }
         }
 
@@ -198,7 +213,7 @@ struct ELF {
             const auto name = func->name();
             const auto addr = func->addr();
 
-            spdlog::info("Find Func {} @ {:x}", name, addr);
+            spdlog::debug("Find Func {} @ {:x}", name, addr);
 
             this->functions.emplace(func);
             this->function_addr_map.emplace(addr, func);
@@ -212,7 +227,7 @@ struct ELF {
                         continue;
                     }
                     this->function_name_map.emplace(alias, func);
-                    spdlog::info("  A.k.a {}", alias);
+                    spdlog::debug("  A.k.a {}", alias);
                 }
             }
 
@@ -223,7 +238,7 @@ struct ELF {
                         continue;
                     }
                     this->function_name_map.emplace(alias, func);
-                    spdlog::info("  A.k.a {}", alias);
+                    spdlog::debug("  A.k.a {}", alias);
                 }
             }
 
@@ -242,38 +257,48 @@ struct ELF {
 
                             // Combine rip into dest
                             // XXX: Hardcode for x86 for now
-                            {
-                                // Assume a indirect jump to *<Imm>(%rip)
-                                const auto op = instr.getOperand(0).format(func->region()->getArch());
-                                const std::regex regex("(-?0x[a-f0-9]+)\\(%rip\\)", std::regex::extended);
-                                std::smatch match;
-                                if(std::regex_match(op, match, regex)) {
-                                    const auto pc = bb->end();  // Account for the instruction size, RIP pointing the next instruction!
-                                    const auto addr_str = match[1].str();
-                                    const auto addr = std::stoul(addr_str, nullptr, 16) + pc;  // pc relative addressing
-                                    spdlog::debug("{:x} {} resolve as a edge to {:x}", out_addr, instr.format(), addr);
-                                    this->cfg[func].dynamic.emplace(addr);
 
-                                    //std::set<Dyninst::ParseAPI::Function*> callees;
-                                    //this->object->findFuncs(func->region(), addr, callees);
-                                    //spdlog::info("{} {} {:x} - {:x}   {}", this->PLT.contains(addr), this->GOT.contains(addr), func->region()->low(), func->region()->high(), callees.size());
-                                    //for (const auto& callee : callees) {
-                                        //spdlog::info("    {} @ {:x}", callee->name(), callee->addr());
-                                    //}
+                            Dyninst::Address callee_addr{};
+
+                            // Assume a indirect jump to *<Imm>(%rip)
+                            const auto op = instr.getOperand(0).format(func->region()->getArch());
+                            const std::regex regex("(-?0x[a-f0-9]+)\\(%rip\\)", std::regex::extended);
+                            std::smatch match;
+                            if(std::regex_match(op, match, regex)) {
+                                const auto pc = bb->end();  // Account for the instruction size, RIP pointing the next instruction!
+                                const auto addr_str = match[1].str();
+                                callee_addr = std::stoul(addr_str, nullptr, 16) + pc;  // pc relative addressing
+
+                                //std::set<Dyninst::ParseAPI::Function*> callees;
+                                //this->object->findFuncs(func->region(), addr, callees);
+                                //spdlog::info("{} {} {:x} - {:x}   {}", this->PLT.contains(addr), this->GOT.contains(addr), func->region()->low(), func->region()->high(), callees.size());
+                                //for (const auto& callee : callees) {
+                                    //spdlog::info("    {} @ {:x}", callee->name(), callee->addr());
+                                //}
 
 
-                                    //if (callee->name() == func->name() && callee->addr() == func->addr()) {
-                                        //continue;  // prevent recursive call
-                                    //} else if (this->PLT.contains(callee->addr())) {
-                                        //this->cfg[func].dynamic.emplace(callee->addr());
-                                    //} else if (this->GOT.contains(callee->addr())) {
-                                        //this->cfg[func].dynamic.emplace(callee->addr());
-                                    //} else {
-                                        //this->cfg[func].static_.emplace(addr);
-                                    //}
+                                //if (callee->name() == func->name() && callee->addr() == func->addr()) {
+                                    //continue;  // prevent recursive call
+                                //} else if (this->PLT.contains(callee->addr())) {
+                                    //this->cfg[func].dynamic.emplace(callee->addr());
+                                //} else if (this->GOT.contains(callee->addr())) {
+                                    //this->cfg[func].dynamic.emplace(callee->addr());
+                                //} else {
+                                    //this->cfg[func].static_.emplace(addr);
+                                //}
+                            }
+
+                            if (callee_addr != Dyninst::Address{}) {
+                                spdlog::debug("{:x} {} resolve as a edge to {:x}", out_addr, instr.format(), callee_addr);
+
+                                if (rela_plt_table.contains(callee_addr)) {
+                                    /* Redirected by PLT.GOT entry */
+                                    this->cfg[func].dynamic.emplace(rela_plt_table[callee_addr]);
                                 } else {
-                                    spdlog::warn("Failed to decode edge {:x}: {}", out_addr, instr.format());
+                                    this->cfg[func].dynamic.emplace(callee_addr);
                                 }
+                            } else {
+                                spdlog::warn("Failed to decode edge {:x}: {}", out_addr, instr.format());
                             }
                         } else {
                             std::vector<Dyninst::ParseAPI::Function*> callees;
