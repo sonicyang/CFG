@@ -17,3 +17,5 @@ target_link_libraries(syscall_list
                       ${DYNINST_Boost_LIBRARIES}
                       spdlog::spdlog
                       )
+
+target_compile_options(syscall_list PRIVATE -Wextra -Wall -Werror)

@@ -66,7 +66,6 @@ endif()
 # Use the same optimization settings used to build Dyninst
 include(optimization)
 
-add_compile_options(-Wextra)
 # ----------------------------------------------------------------------------#
 
 # Set up the individual examples
