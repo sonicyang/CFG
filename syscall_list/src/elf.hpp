@@ -48,6 +48,7 @@ struct ELF {
     struct CallDest {
         std::set<Dyninst::ParseAPI::Function*> static_;
         std::set<Dyninst::Address> dynamic;
+        std::set<Dyninst::Address> syscall;
     };
 
     std::map<Dyninst::ParseAPI::Function*, CallDest> cfg;
@@ -274,7 +275,8 @@ struct ELF {
                             if(is_syscall(instr)) {
                                 const auto syscall_nbr = parse_syscall(func, bb, out_addr, instr);
                                 if (syscall_nbr) {
-                                    spdlog::info("Syscall({}) detected! {} @ {:x}", syscall_nbr.value(), name, out_addr);
+                                    spdlog::debug("Syscall({}) detected! {} @ {:x}", syscall_nbr.value(), name, out_addr);
+                                    this->cfg[func].syscall.emplace(syscall_nbr.value());
                                 } else {
                                     spdlog::warn("Syscall number decode failed {} @ {:x}", name, out_addr);
                                 }
@@ -427,6 +429,60 @@ struct ELF {
                 this->cfg[func].static_.emplace(callee);
             }
         }
+    }
+
+    static void traverse_called_funcs(const auto& object, const auto& symbol, auto& func_callback, auto& syscall_callback, auto& bogus_callback, std::set<std::pair<std::string, Dyninst::Address>>& seen, const int layer) {
+        const auto& elf = ELFCache.at(object);
+        const auto& func = [&] {
+            if constexpr (std::is_same_v<Dyninst::ParseAPI::Function*, std::decay_t<decltype(symbol)>>) {
+                return symbol;
+            } else if constexpr (std::is_same_v<std::set<std::string>, std::decay_t<decltype(symbol)>>) {
+                const auto rsymbol = *symbol.cbegin();
+                return elf.function_name_map.at(rsymbol);
+            } else {
+                return elf.function_name_map.at(symbol);
+            }
+        }();
+
+        // Prevent Loop
+        const auto current = std::make_pair(object, func->addr());
+        if (seen.contains(current)) {
+            return;
+        }
+        seen.emplace(current);
+
+        func_callback(layer, object, func);
+
+        if (!elf.cfg.contains(func)) {
+            return;  // Don't call anything
+        }
+
+        const auto next_level = [&](const auto& obj, const auto sym) {
+            traverse_called_funcs(obj, sym, func_callback, syscall_callback, bogus_callback, seen, layer + 1);
+        };
+
+        for (const auto& syscall_nbr : elf.cfg.at(func).syscall) {
+            syscall_callback(layer + 1, object, func, syscall_nbr);
+        }
+        for (const auto& callee : elf.cfg.at(func).static_) {
+            next_level(object, callee);
+        }
+        for (const auto& addr : elf.cfg.at(func).dynamic) {
+            if (elf.GOT.contains(addr)) {
+                const auto callee = elf.GOT.at(addr);
+                next_level(callee.object, callee.symbols);
+            } else if (elf.PLT.contains(addr)) {
+                const auto callee = elf.PLT.at(addr);
+                next_level(callee.object, callee.symbols);
+            } else {
+                bogus_callback(layer + 1, object, func, addr);
+            }
+        }
+    }
+
+    static void traverse_called_funcs(const auto& object, const auto& symbol, auto& func_callback, auto& syscall_callback, auto& bogus_callback) {
+        std::set<std::pair<std::string, Dyninst::Address>> seen;
+        traverse_called_funcs(object, symbol, func_callback, syscall_callback, bogus_callback, seen, 0);
     }
 };
 

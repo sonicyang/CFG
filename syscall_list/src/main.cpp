@@ -25,59 +25,13 @@
 #include "InstructionDecoder.h"
 
 #include "elf.hpp"
+#include "syscall_table.h"
 
 namespace ParseAPI = Dyninst::ParseAPI;
 namespace SymtabAPI = Dyninst::SymtabAPI;
 namespace InstructionAPI = Dyninst::InstructionAPI;
 
 BPatch bp;
-
-static inline void traverse(const auto& object, const auto& symbol, std::set<std::pair<std::string, Dyninst::Address>>& seen, const int layer) {
-    const auto& elf = ELFCache.at(object);
-    const auto& func = [&] {
-        if constexpr (std::is_same_v<ParseAPI::Function*, std::decay_t<decltype(symbol)>>) {
-            return symbol;
-        } else if constexpr (std::is_same_v<std::set<std::string>, std::decay_t<decltype(symbol)>>) {
-            const auto rsymbol = *symbol.cbegin();
-            return elf.function_name_map.at(rsymbol);
-        } else {
-            return elf.function_name_map.at(symbol);
-        }
-    }();
-
-    // Prevent Loop
-    const auto current = std::make_pair(object, func->addr());
-    if (seen.contains(current)) {
-        return;
-    }
-    seen.emplace(current);
-
-    spdlog::info("{3: <{4}}{0} {1} {2}", object, func->name(), func->addr(), "", layer);
-
-    if (!elf.cfg.contains(func)) {
-        return;  // Don't call anything
-    }
-
-    for (const auto& callee : elf.cfg.at(func).static_) {
-        traverse(object, callee, seen, layer + 1);
-    }
-    for (const auto& addr : elf.cfg.at(func).dynamic) {
-        if (elf.GOT.contains(addr)) {
-            const auto callee = elf.GOT.at(addr);
-            traverse(callee.object, callee.symbols, seen, layer + 1);
-        } else if (elf.PLT.contains(addr)) {
-            const auto callee = elf.PLT.at(addr);
-            traverse(callee.object, callee.symbols, seen, layer + 1);
-        } else {
-            spdlog::info("{2: <{3}}Bogus call {0} {1:x}", object, addr, "", layer + 1);
-        }
-    }
-}
-
-static inline void traverse(const auto& object, const auto& symbol) {
-    std::set<std::pair<std::string, Dyninst::Address>> seen;
-    traverse(object, symbol, seen, 0);
-}
 
 int main(const int argc, const char *argv[]) {
     if (argc < 2) {
@@ -106,5 +60,45 @@ int main(const int argc, const char *argv[]) {
     /* Entry point, assume as _start */
     constexpr auto entry_name = "main";
 
-    traverse(exe_name, entry_name);
+    using syscall = std::pair<Dyninst::Address, std::size_t>;
+    std::array<syscall, 512> syscalls_count{};
+    for (Dyninst::Address c = 0; auto& entry : syscalls_count) {
+        entry = std::make_pair(c++, 0);
+    }
+    std::size_t total_syscalls{};
+
+    const auto func_printer = [](const auto layer, const auto& object, const auto& func) {
+        //spdlog::info("{3: <{4}}{0} {1} {2}", object, func->name(), func->addr(), "", layer);
+    };
+
+    const auto syscall_printer = [&](const auto layer, const auto& object, const auto& func, const auto syscall_nbr) {
+        //spdlog::info("{2: <{3}} syscall {0} {1}", syscall_nbr, "", "", layer + 1);
+        syscalls_count[syscall_nbr].second++;
+        total_syscalls++;
+    };
+
+    const auto bogus_printer = [](const auto layer, const auto& object, const auto& func, const auto addr) {
+        //spdlog::info("{2: <{3}}Bogus call {0} {1:x}", object, addr, "", layer);
+    };
+
+    ELF::traverse_called_funcs(exe_name, entry_name, func_printer, syscall_printer, bogus_printer);
+
+    const auto comp = [](const auto& p0, const auto& p1) {
+            return p0.second < p1.second;
+    };
+    std::make_heap(syscalls_count.begin(), syscalls_count.end(), comp);
+
+    spdlog::info("Syscall statistic (Total: {}):", total_syscalls);
+    constexpr auto expand = 2;
+    auto c = 0;
+    while(true) {
+        const auto[nbr, count] = *syscalls_count.cbegin();
+        if (count) {
+            spdlog::info("  {0:<6}{1:<25}: {2:<6} [{3:=<{4}}", nbr, syscall_name(nbr), count, "", static_cast<std::size_t>(count / (total_syscalls / 100. / expand)));
+        } else {
+            break;
+        }
+        std::pop_heap(syscalls_count.begin(), syscalls_count.end() - c, comp);
+        c++;
+    }
 }
