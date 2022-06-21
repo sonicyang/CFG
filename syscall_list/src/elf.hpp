@@ -15,6 +15,14 @@
 
 #include "spdlog/spdlog.h"
 
+#include "BPatch.h"
+#include "BPatch_addressSpace.h"
+#include "BPatch_process.h"
+#include "BPatch_object.h"
+#include "BPatch_binaryEdit.h"
+#include "BPatch_function.h"
+#include "BPatch_point.h"
+#include "BPatch_flowGraph.h"
 #include "CFG.h"
 #include "CodeObject.h"
 #include "Function.h"
@@ -28,7 +36,41 @@
 
 struct ELF;
 
-inline std::map<std::string, ELF> ELFCache;
+struct ELFCache {
+    static inline auto& get() {
+        static ELFCache instance;
+        return instance;
+    }
+
+    static inline auto findLib(const std::string& name) {
+        const std::filesystem::path search_path[] = {
+            "/lib",
+            "/lib64",
+            "/usr/lib",
+            "/usr/lib64",
+            "/usr/local/lib",
+            "/usr/local/lib64"
+        };
+        for (const auto& path : search_path) {
+            if (std::filesystem::exists(path / name)) {
+                return (path / name).string();
+            }
+        }
+        throw std::runtime_error(name + " not found!");
+    }
+
+    inline auto find(const std::string& name);
+    inline auto find(const std::string& name, const std::string& path);
+
+    inline auto set_modules(auto* modules) {
+        this->m = modules;
+    }
+
+ private:
+    ELFCache() {};
+    static inline std::map<std::string, ELF> cache;
+    static inline std::vector<BPatch_module*>* m;
+};
 
 struct ELF {
     std::set<Dyninst::ParseAPI::Function*> functions;
@@ -44,6 +86,8 @@ struct ELF {
 
     std::map<Dyninst::Address, DynamicSymbol> GOT;
     std::map<Dyninst::Address, DynamicSymbol> PLT;
+    std::map<std::string, Dyninst::Address> rela_dyn_table;
+    std::map<Dyninst::Address, Dyninst::Address> rela_plt_table;
 
     struct CallDest {
         std::set<Dyninst::ParseAPI::Function*> static_;
@@ -63,35 +107,197 @@ struct ELF {
     ELF(const ELF&) = default;
     ELF& operator=(const ELF&) = default;
 
-    static inline auto findLib(const std::string& name) {
-        const std::filesystem::path search_path[] = {
-            "/lib",
-            "/lib64",
-            "/usr/lib",
-            "/usr/lib64",
-            "/usr/local/lib",
-            "/usr/local/lib64"
-        };
-        for (const auto& path : search_path) {
-            if (std::filesystem::exists(path / name)) {
-                return (path / name).string();
-            }
-        }
-        throw std::runtime_error(name + " not found!");
-    }
-
+ private:
     template<typename Table>
     static inline auto add_dynamic_entry(Table& table, const Dyninst::Address addr, const std::string& lib, const std::string& name) {
         if (table.contains(addr)) {
-            spdlog::info("{} vs {} for {} @ {:x}", table[addr].object, lib, name, addr);
             //assert(table[addr].object == lib);
             table[addr].symbols.emplace(name);
         } else {
-            spdlog::info("Add {} {} @ {:x}", lib, name, addr);
             table.emplace(addr, DynamicSymbol{lib, std::set{name}});
         }
     }
 
+    auto is_syscall(const auto& instr) {
+        const std::regex syscall("syscall.*", std::regex::extended);
+        std::smatch match;
+        const auto instr_str = instr.format();
+        return std::regex_match(instr_str, match, syscall);
+    }
+
+    auto make_assignments(const auto& func, const auto& bb, const auto& addr, const auto& instr) {
+        // Convert the instruction to assignments
+        Dyninst::AssignmentConverter ac(true, true);
+        std::vector<Dyninst::Assignment::Ptr> assignments;
+        ac.convert(instr, addr, func, bb, assignments);
+        return assignments;
+    }
+
+    auto parse_syscall(const auto& func, const auto& bb, const auto& addr, const auto& instr) -> std::optional<Dyninst::Address> {
+        // Fake a assignment of rax -> rax
+        Dyninst::AbsRegion syscall_reg(Dyninst::MachRegister::getSyscallNumberReg(func->region()->getArch()));
+        auto syscall_assign = Dyninst::Assignment::makeAssignment(instr, addr, func, bb, syscall_reg);
+        syscall_assign->addInput(syscall_reg);
+
+        // Create a Slicer that will start from the given assignment
+        Dyninst::Slicer s(syscall_assign, bb, func);
+        Dyninst::Slicer::Predicates mp;
+        const auto slice = s.backwardSlice(mp);
+
+        // Expand the expression
+        Dyninst::DataflowAPI::Result_t symRet;
+        Dyninst::DataflowAPI::SymEval::expand(slice, symRet);
+
+        // Find the AST which outputs the syscall reg assignment
+        const auto [_, syscall_nbr_assign] = *std::find_if(symRet.cbegin(), symRet.cend(),
+            [&syscall_reg](const auto& in) {
+                const auto& [key, val] = in;
+                return key->out() == syscall_reg;
+            });
+
+        if (syscall_nbr_assign.get() == nullptr) {
+            return {};
+        }
+
+        // Resolve is using the custom AST visitor
+        SyscallNumberVisitor visitor;
+        syscall_nbr_assign->accept(&visitor);
+
+        if (visitor.resolved) {
+            return visitor.number;
+        } else {
+            return {};
+        }
+    }
+
+    auto parse_external_call(const auto& func, const auto& bb) -> std::optional<Dyninst::Address> {
+        // Decode
+        const auto out_addr = bb->last();
+        const auto instr = bb->getInsn(bb->last());
+        spdlog::debug("DynInst failed to auto decode edge {:x}: {}", out_addr, instr.format());
+
+        // Convert the instruction to assignments
+        const auto assignments = make_assignments(func, bb, out_addr, instr);
+
+        // An instruction can corresponds to multiple assignment.
+        // Here we look for the assignment that changes the PC.
+        const auto pc_assign = *std::find_if(assignments.cbegin(), assignments.cend(), [](const auto& assignment) {
+            const auto& out = assignment->out();
+            return out.absloc().type() == Dyninst::Absloc::Register && out.absloc().reg().isPC();
+        });
+
+        if (pc_assign->inputs().size() > 0 && pc_assign->inputs()[0].absloc().type() == Dyninst::Absloc::Heap) {
+            // Don't brother to do slicing is we can find the PC relative call
+            return pc_assign->inputs()[0].absloc().addr();
+        } else {
+            // Create a Slicer that will start from the given assignment
+            Dyninst::Slicer s(pc_assign, bb, func);
+            // Slice to fund the register indirect call
+            Dyninst::Slicer::Predicates mp;
+            const auto slice = s.backwardSlice(mp);
+
+            // Expand the expression
+            Dyninst::DataflowAPI::Result_t symRet;
+            Dyninst::DataflowAPI::SymEval::expand(slice, symRet);
+
+            // Resolve is using the custom AST visitor
+            const auto pc_exp = symRet[pc_assign];
+            ProcedureCallVisitor visitor;
+            pc_exp->accept(&visitor);
+
+            if (visitor.resolved && visitor.target) {  // Call to Null is ambiguous
+                return visitor.target;
+            }
+        }
+
+        return {};
+    }
+
+    auto parse_internal_call(const auto& func, const auto& target) {
+        std::vector<Dyninst::ParseAPI::Function*> callees;
+        target->trg()->getFuncs(callees);
+        for (auto& callee : callees) {
+            if (callee->name() == func->name() && callee->addr() == func->addr()) {
+                continue;  // prevent recursive call
+            } else if (this->PLT.contains(callee->addr())) {
+                spdlog::debug("PLT {} has a edge to {:}", func->name(), *PLT[callee->addr()].symbols.cbegin());
+                this->cfg[func].dynamic.emplace(callee->addr());
+            } else if (this->GOT.contains(callee->addr())) {
+                spdlog::debug("GOT {} has a edge to {:}", func->name(), *GOT[callee->addr()].symbols.cbegin());
+                this->cfg[func].dynamic.emplace(callee->addr());
+            } else {
+                spdlog::debug("STATIC {} has a edge to {:}", func->name(), callee->name());
+                this->cfg[func].static_.emplace(callee);
+            }
+        }
+    }
+
+    static void traverse_called_funcs(const auto& object, const auto& symbol, auto& func_callback, auto& syscall_callback, auto& bogus_callback, std::set<std::pair<std::string, Dyninst::Address>>& seen, const int layer) {
+        auto elf = ELFCache::get().find(object);
+        const auto func = [&] {
+            if constexpr (std::is_same_v<Dyninst::ParseAPI::Function*, std::decay_t<decltype(symbol)>>) {
+                return symbol;
+            } else if constexpr (std::is_same_v<std::set<std::string>, std::decay_t<decltype(symbol)>>) {
+                const auto rsymbol = *symbol.cbegin();
+                if (elf.function_name_map.contains(rsymbol)) {
+                    return elf.function_name_map.at(rsymbol);
+                } else {
+                    spdlog::error("Failed to find function {} in {}", rsymbol, object);
+                    return static_cast<Dyninst::ParseAPI::Function*>(nullptr);
+                }
+            } else {
+                if (elf.function_name_map.contains(symbol)) {
+                    return elf.function_name_map.at(symbol);
+                } else {
+                    spdlog::error("Failed to find function {} in {}", symbol, object);
+                    return static_cast<Dyninst::ParseAPI::Function*>(nullptr);
+                }
+            }
+        }();
+
+        if (func == nullptr)
+            return;
+
+        // Prevent Loop
+        const auto current = std::make_pair(object, func->addr());
+        if (seen.contains(current)) {
+            return;
+        }
+        seen.emplace(current);
+
+        func_callback(layer, object, func);
+
+        // resolve the cfg
+        elf.resolve(func);
+
+        if (!elf.cfg.contains(func)) {
+            return;  // Don't call anything
+        }
+
+        const auto next_level = [&](const auto& obj, const auto sym) {
+            traverse_called_funcs(obj, sym, func_callback, syscall_callback, bogus_callback, seen, layer + 1);
+        };
+
+        for (const auto& syscall_nbr : elf.cfg.at(func).syscall) {
+            syscall_callback(layer + 1, object, func, syscall_nbr);
+        }
+        for (const auto& callee : elf.cfg.at(func).static_) {
+            next_level(object, callee);
+        }
+        for (const auto& addr : elf.cfg.at(func).dynamic) {
+            if (elf.GOT.contains(addr)) {
+                const auto callee = elf.GOT.at(addr);
+                next_level(callee.object, callee.symbols);
+            } else if (elf.PLT.contains(addr)) {
+                const auto callee = elf.PLT.at(addr);
+                next_level(callee.object, callee.symbols);
+            } else {
+                bogus_callback(layer + 1, object, func, addr);
+            }
+        }
+    }
+
+ public:
     template<typename M>
     ELF(const std::string& path_, const std::string& name_, const M& modules) :
         name(name_), path(path_),
@@ -133,8 +339,6 @@ struct ELF {
         object->finalize();
 
         /* DynInst is a TARD, cannot let use parse GOT easily */
-        std::map<std::string, Dyninst::Address> rela_dyn_table;
-        std::map<Dyninst::Address, Dyninst::Address> rela_plt_table;
         const auto process_reloations = [&](const auto relocations) {
             for (const auto& relocation : relocations) {
                 // XXX: For x86-64,
@@ -260,245 +464,54 @@ struct ELF {
                     spdlog::debug("  A.k.a {}", alias);
                 }
             }
-
-            for (const auto& bb : func->blocks()) {
-                for (const auto& target : bb->targets()) {
-                    if (target->type() == Dyninst::ParseAPI::EdgeTypeEnum::RET) {
-                        // Ignore returns
-                        continue;
-                    }
-                    if (target->interproc()) {
-                        // Possible calling a GOT using indirect call
-                        // Ignore PLTs
-                        if (target->sinkEdge() && !this->PLT.contains(bb->last())) {
-                            // Decode
-                            const auto out_addr = bb->last();
-                            const auto instr = bb->getInsn(bb->last());
-                            spdlog::debug("DynInst failed to auto decode edge {:x}: {}", out_addr, instr.format());
-
-                            if(is_syscall(instr)) {
-                                const auto syscall_nbr = parse_syscall(func, bb, out_addr, instr);
-                                if (syscall_nbr) {
-                                    spdlog::debug("Syscall({}) detected! {} @ {:x}", syscall_nbr.value(), name, out_addr);
-                                    this->cfg[func].syscall.emplace(syscall_nbr.value());
-                                } else {
-                                    spdlog::warn("Syscall number decode failed {} @ {:x}", name, out_addr);
-                                }
-                            } else {  // Not syscall
-                                const auto callee_addr = parse_external_call(func, bb);
-                                if (callee_addr) {
-                                    spdlog::debug("{} @ {:x} BB target AST resolved as a edge to {:x}", name, out_addr, callee_addr.value());
-                                    if (rela_plt_table.contains(callee_addr.value())) {
-                                        /* Redirected by PLT.GOT entry */
-                                        this->cfg[func].dynamic.emplace(rela_plt_table[callee_addr.value()]);
-                                    } else {
-                                        this->cfg[func].dynamic.emplace(callee_addr.value());
-                                    }
-                                } else {
-                                    spdlog::warn("{} @ {:x} {} BB target AST resolution Failed!", name, out_addr, instr.format());
-                                }
-                            } // End indirect call and syscall
-                        } else {
-                            parse_internal_call(func, target);
-                        }
-                    }
-                }
-            }
         }
 
         /* Commit all the changes */
         object->finalize();
-
-        /* Recursively resolve any dynamic libraries, avoid recursive to our self */
-        for (const auto& [addr, entry] : GOT) {
-            const auto [obj, symbol] = entry;
-            if (!ELFCache.contains(obj) && obj != this->name) {
-                const auto path = findLib(obj);
-                ELFCache.emplace(obj, ELF(path, obj, modules));
-            }
-        }
-
-        for (const auto& [addr, entry] : PLT) {
-            const auto [obj, symbol] = entry;
-            if (!ELFCache.contains(obj) && obj != this->name) {
-                const auto path = findLib(obj);
-                ELFCache.emplace(obj, ELF(path, obj, modules));
-            }
-        }
     }
 
-    auto is_syscall(const auto& instr) {
-        const std::regex syscall("syscall.*", std::regex::extended);
-        std::smatch match;
-        const auto instr_str = instr.format();
-        return std::regex_match(instr_str, match, syscall);
-    }
-
-    auto make_assignments(const auto& func, const auto& bb, const auto& addr, const auto& instr) {
-        // Convert the instruction to assignments
-        Dyninst::AssignmentConverter ac(true, true);
-        std::vector<Dyninst::Assignment::Ptr> assignments;
-        ac.convert(instr, addr, func, bb, assignments);
-        return assignments;
-    }
-
-    auto parse_syscall(const auto& func, const auto& bb, const auto& addr, const auto& instr) -> std::optional<Dyninst::Address> {
-        // Fake a assignment of rax -> rax
-        Dyninst::AbsRegion syscall_reg(Dyninst::MachRegister::getSyscallNumberReg(func->region()->getArch()));
-        auto syscall_assign = Dyninst::Assignment::makeAssignment(instr, addr, func, bb, syscall_reg);
-        syscall_assign->addInput(syscall_reg);
-
-        // Create a Slicer that will start from the given assignment
-        Dyninst::Slicer s(syscall_assign, bb, func);
-        Dyninst::Slicer::Predicates mp;
-        const auto slice = s.backwardSlice(mp);
-
-        // Expand the expression
-        Dyninst::DataflowAPI::Result_t symRet;
-        Dyninst::DataflowAPI::SymEval::expand(slice, symRet);
-
-        // Find the AST which outputs the syscall reg assignment
-        const auto [_, syscall_nbr_assign] = *std::find_if(symRet.cbegin(), symRet.cend(),
-            [&syscall_reg](const auto& in) {
-                const auto& [key, val] = in;
-                return key->out() == syscall_reg;
-            });
-
-        if (syscall_nbr_assign.get() == nullptr) {
-            return {};
-        }
-
-        // Resolve is using the custom AST visitor
-        SyscallNumberVisitor visitor;
-        syscall_nbr_assign->accept(&visitor);
-
-        if (visitor.resolved) {
-            return visitor.number;
-        } else {
-            return {};
-        }
-    }
-
-    auto parse_external_call(const auto& func, const auto& bb) -> std::optional<Dyninst::Address> {
-        // Decode
-        const auto out_addr = bb->last();
-        const auto instr = bb->getInsn(bb->last());
-        spdlog::debug("DynInst failed to auto decode edge {:x}: {}", out_addr, instr.format());
-
-        // Convert the instruction to assignments
-        const auto assignments = make_assignments(func, bb, out_addr, instr);
-
-        // An instruction can corresponds to multiple assignment.
-        // Here we look for the assignment that changes the PC.
-        const auto pc_assign = *std::find_if(assignments.cbegin(), assignments.cend(), [](const auto& assignment) {
-            const auto& out = assignment->out();
-            return out.absloc().type() == Dyninst::Absloc::Register && out.absloc().reg().isPC();
-        });
-
-        if (pc_assign->inputs().size() > 0 && pc_assign->inputs()[0].absloc().type() == Dyninst::Absloc::Heap) {
-            // Don't brother to do slicing is we can find the PC relative call
-            return pc_assign->inputs()[0].absloc().addr();
-        } else {
-            // Create a Slicer that will start from the given assignment
-            Dyninst::Slicer s(pc_assign, bb, func);
-            // Slice to fund the register indirect call
-            Dyninst::Slicer::Predicates mp;
-            const auto slice = s.backwardSlice(mp);
-
-            // Expand the expression
-            Dyninst::DataflowAPI::Result_t symRet;
-            Dyninst::DataflowAPI::SymEval::expand(slice, symRet);
-
-            // Resolve is using the custom AST visitor
-            const auto pc_exp = symRet[pc_assign];
-            ProcedureCallVisitor visitor;
-            pc_exp->accept(&visitor);
-
-            if (visitor.resolved && visitor.target) {  // Call to Null is ambiguous
-                return visitor.target;
-            }
-        }
-
-        return {};
-    }
-
-    auto parse_internal_call(const auto& func, const auto& target) {
-        std::vector<Dyninst::ParseAPI::Function*> callees;
-        target->trg()->getFuncs(callees);
-        for (auto& callee : callees) {
-            if (callee->name() == func->name() && callee->addr() == func->addr()) {
-                continue;  // prevent recursive call
-            } else if (this->PLT.contains(callee->addr())) {
-                spdlog::debug("PLT {} has a edge to {:}", func->name(), *PLT[callee->addr()].symbols.cbegin());
-                this->cfg[func].dynamic.emplace(callee->addr());
-            } else if (this->GOT.contains(callee->addr())) {
-                spdlog::debug("GOT {} has a edge to {:}", func->name(), *GOT[callee->addr()].symbols.cbegin());
-                this->cfg[func].dynamic.emplace(callee->addr());
-            } else {
-                spdlog::debug("STATIC {} has a edge to {:}", func->name(), callee->name());
-                this->cfg[func].static_.emplace(callee);
-            }
-        }
-    }
-
-    static void traverse_called_funcs(const auto& object, const auto& symbol, auto& func_callback, auto& syscall_callback, auto& bogus_callback, std::set<std::pair<std::string, Dyninst::Address>>& seen, const int layer) {
-        const auto& elf = ELFCache.at(object);
-        const auto func = [&] {
-            if constexpr (std::is_same_v<Dyninst::ParseAPI::Function*, std::decay_t<decltype(symbol)>>) {
-                return symbol;
-            } else if constexpr (std::is_same_v<std::set<std::string>, std::decay_t<decltype(symbol)>>) {
-                const auto rsymbol = *symbol.cbegin();
-                if (elf.function_name_map.contains(rsymbol)) {
-                    return elf.function_name_map.at(rsymbol);
-                } else {
-                    spdlog::error("Failed to find function {} in {}", rsymbol, object);
-                    return static_cast<Dyninst::ParseAPI::Function*>(nullptr);
+    inline auto resolve(Dyninst::ParseAPI::Function* func) {
+        for (const auto& bb : func->blocks()) {
+            for (const auto& target : bb->targets()) {
+                if (target->type() == Dyninst::ParseAPI::EdgeTypeEnum::RET) {
+                    // Ignore returns
+                    continue;
                 }
-            } else {
-                if (elf.function_name_map.contains(symbol)) {
-                    return elf.function_name_map.at(symbol);
-                } else {
-                    spdlog::error("Failed to find function {} in {}", symbol, object);
-                    return static_cast<Dyninst::ParseAPI::Function*>(nullptr);
+                if (target->interproc()) {
+                    // Possible calling a GOT using indirect call
+                    // Ignore PLTs
+                    if (target->sinkEdge() && !this->PLT.contains(bb->last())) {
+                        // Decode
+                        const auto out_addr = bb->last();
+                        const auto instr = bb->getInsn(bb->last());
+                        spdlog::debug("DynInst failed to auto decode edge {:x}: {}", out_addr, instr.format());
+
+                        if(is_syscall(instr)) {
+                            const auto syscall_nbr = parse_syscall(func, bb, out_addr, instr);
+                            if (syscall_nbr) {
+                                spdlog::debug("Syscall({}) detected! {} @ {:x}", syscall_nbr.value(), name, out_addr);
+                                this->cfg[func].syscall.emplace(syscall_nbr.value());
+                            } else {
+                                spdlog::warn("Syscall number decode failed {} @ {:x}", name, out_addr);
+                            }
+                        } else {  // Not syscall
+                            const auto callee_addr = parse_external_call(func, bb);
+                            if (callee_addr) {
+                                spdlog::debug("{} @ {:x} BB target AST resolved as a edge to {:x}", name, out_addr, callee_addr.value());
+                                if (this->rela_plt_table.contains(callee_addr.value())) {
+                                    /* Redirected by PLT.GOT entry */
+                                    this->cfg[func].dynamic.emplace(this->rela_plt_table[callee_addr.value()]);
+                                } else {
+                                    this->cfg[func].dynamic.emplace(callee_addr.value());
+                                }
+                            } else {
+                                spdlog::warn("{} @ {:x} {} BB target AST resolution Failed!", name, out_addr, instr.format());
+                            }
+                        } // End indirect call and syscall
+                    } else {
+                        parse_internal_call(func, target);
+                    }
                 }
-            }
-        }();
-
-        if (func == nullptr)
-            return;
-
-        // Prevent Loop
-        const auto current = std::make_pair(object, func->addr());
-        if (seen.contains(current)) {
-            return;
-        }
-        seen.emplace(current);
-
-        func_callback(layer, object, func);
-
-        if (!elf.cfg.contains(func)) {
-            return;  // Don't call anything
-        }
-
-        const auto next_level = [&](const auto& obj, const auto sym) {
-            traverse_called_funcs(obj, sym, func_callback, syscall_callback, bogus_callback, seen, layer + 1);
-        };
-
-        for (const auto& syscall_nbr : elf.cfg.at(func).syscall) {
-            syscall_callback(layer + 1, object, func, syscall_nbr);
-        }
-        for (const auto& callee : elf.cfg.at(func).static_) {
-            next_level(object, callee);
-        }
-        for (const auto& addr : elf.cfg.at(func).dynamic) {
-            if (elf.GOT.contains(addr)) {
-                const auto callee = elf.GOT.at(addr);
-                next_level(callee.object, callee.symbols);
-            } else if (elf.PLT.contains(addr)) {
-                const auto callee = elf.PLT.at(addr);
-                next_level(callee.object, callee.symbols);
-            } else {
-                bogus_callback(layer + 1, object, func, addr);
             }
         }
     }
@@ -509,3 +522,19 @@ struct ELF {
     }
 };
 
+inline auto ELFCache::find(const std::string& name, const std::string& path) {
+    /* Recursively resolve any dynamic libraries, avoid recursive to our self */
+    if (!this->cache.contains(name)) {
+        this->cache.emplace(name, ELF(path, name, *m));
+    }
+    return this->cache[name];
+}
+
+inline auto ELFCache::find(const std::string& name) {
+    /* Recursively resolve any dynamic libraries, avoid recursive to our self */
+    if (!this->cache.contains(name)) {
+        const auto path = findLib(name);
+        this->cache.emplace(name, ELF(path, name, *m));
+    }
+    return this->cache[name];
+}

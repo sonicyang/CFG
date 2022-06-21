@@ -78,13 +78,15 @@ int main(const int argc, const char *argv[]) {
     image->getObjects(objs);
     assert(objs.size() > 0);
 
+    ELFCache::get().set_modules(image->getModules());
+
     // Assume the last one is the executable
     const auto& exe_obj = *(objs.cend() - 1);
     const auto exe_name = exe_obj->name();
     const auto exe_path = exe_obj->pathName();
 
-    /* Recursive create the cache */
-    ELFCache.emplace(exe_name, ELF(exe_path, exe_name, *image->getModules()));
+    /* Create the cache for the exe*/
+    ELFCache::get().find(exe_name, exe_path);
 
     /* Entry point, assume as _start */
     constexpr auto entry_name = "main";
