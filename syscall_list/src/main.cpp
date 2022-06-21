@@ -8,6 +8,7 @@
 #include <regex>
 #include <vector>
 
+#include <fmt/format.h>
 #include <spdlog/spdlog.h>
 
 #include "BPatch.h"
@@ -33,11 +34,39 @@ namespace InstructionAPI = Dyninst::InstructionAPI;
 
 BPatch bp;
 
+static inline auto init_logging() {
+    const auto level = std::getenv("LOGLEVEL");
+    if (level) {
+        switch(std::stol(level)) {
+            case 0:
+                spdlog::set_level(spdlog::level::off);
+                break;
+            case 1:
+                spdlog::set_level(spdlog::level::debug);
+                break;
+            case 2:
+                spdlog::set_level(spdlog::level::warn);
+                break;
+            case 4:
+                spdlog::set_level(spdlog::level::debug);
+                break;
+            case 5:
+                spdlog::set_level(spdlog::level::trace);
+                break;
+            case 3:
+            default:
+                spdlog::set_level(spdlog::level::info);
+        }
+    }
+}
+
 int main(const int argc, const char *argv[]) {
     if (argc < 2) {
         std::cerr << "Usage: " << argv[0] << " <executable> <args...>\n";
         return -1;
     }
+
+    init_logging();
 
     spdlog::info("Create process from {}", argv[1]);
     const auto process = bp.processCreate(argv[1], argv + 2);
@@ -60,21 +89,17 @@ int main(const int argc, const char *argv[]) {
     /* Entry point, assume as _start */
     constexpr auto entry_name = "main";
 
-    using syscall = std::pair<Dyninst::Address, std::size_t>;
-    std::array<syscall, 512> syscalls_count{};
-    for (Dyninst::Address c = 0; auto& entry : syscalls_count) {
-        entry = std::make_pair(c++, 0);
-    }
-    std::size_t total_syscalls{};
+    std::map<Dyninst::Address, std::vector<std::pair<std::string, Dyninst::ParseAPI::Function*>>> syscalls;
 
-    const auto func_printer = [](const auto layer, const auto& object, const auto& func) {
-        //spdlog::info("{3: <{4}}{0} {1} {2}", object, func->name(), func->addr(), "", layer);
+    const auto func_printer = [&](const auto layer, const auto& object, const auto& func) {
+        //if (func->name().starts_with("targ"))
+            //return;
+        spdlog::info("{3: <{4}}{0} {1} {2:x}", object, func->name(), func->addr(), "", layer);
     };
 
     const auto syscall_printer = [&](const auto layer, const auto& object, const auto& func, const auto syscall_nbr) {
         //spdlog::info("{2: <{3}} syscall {0} {1}", syscall_nbr, "", "", layer + 1);
-        syscalls_count[syscall_nbr].second++;
-        total_syscalls++;
+        syscalls[syscall_nbr].emplace_back(std::make_pair(object, func));
     };
 
     const auto bogus_printer = [](const auto layer, const auto& object, const auto& func, const auto addr) {
@@ -83,22 +108,22 @@ int main(const int argc, const char *argv[]) {
 
     ELF::traverse_called_funcs(exe_name, entry_name, func_printer, syscall_printer, bogus_printer);
 
-    const auto comp = [](const auto& p0, const auto& p1) {
-            return p0.second < p1.second;
-    };
-    std::make_heap(syscalls_count.begin(), syscalls_count.end(), comp);
-
-    spdlog::info("Syscall statistic (Total: {}):", total_syscalls);
-    constexpr auto expand = 2;
-    auto c = 0;
-    while(true) {
-        const auto[nbr, count] = *syscalls_count.cbegin();
-        if (count) {
-            spdlog::info("  {0:<6}{1:<25}: {2:<6} [{3:=<{4}}", nbr, syscall_name(nbr), count, "", static_cast<std::size_t>(count / (total_syscalls / 100. / expand)));
-        } else {
-            break;
+    constexpr auto max_nbr = 512;
+    spdlog::info("");
+    spdlog::info("");
+    spdlog::info("=========================");
+    spdlog::info("Syscall statistic:");
+    for (auto nbr = 0; nbr < max_nbr; nbr++) {
+        const auto str = syscall_name(nbr);
+        if (str) {
+            const auto yes = syscalls.contains(nbr);
+            std::string callers{};
+            if (yes) {
+                for (auto&[obj, func] : syscalls[nbr]) {
+                    callers += fmt::format("{}@{}  ", func->name(), obj);
+                }
+            }
+            spdlog::info("{0:<3}{1:<4}{2:<25} : {3:}", yes ? "o" : "", nbr, str.value(), callers);
         }
-        std::pop_heap(syscalls_count.begin(), syscalls_count.end() - c, comp);
-        c++;
     }
 }

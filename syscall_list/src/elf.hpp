@@ -83,9 +83,11 @@ struct ELF {
     template<typename Table>
     static inline auto add_dynamic_entry(Table& table, const Dyninst::Address addr, const std::string& lib, const std::string& name) {
         if (table.contains(addr)) {
-            assert(table[addr].object == lib);
+            spdlog::info("{} vs {} for {} @ {:x}", table[addr].object, lib, name, addr);
+            //assert(table[addr].object == lib);
             table[addr].symbols.emplace(name);
         } else {
+            spdlog::info("Add {} {} @ {:x}", lib, name, addr);
             table.emplace(addr, DynamicSymbol{lib, std::set{name}});
         }
     }
@@ -261,12 +263,14 @@ struct ELF {
 
             for (const auto& bb : func->blocks()) {
                 for (const auto& target : bb->targets()) {
+                    if (target->type() == Dyninst::ParseAPI::EdgeTypeEnum::RET) {
+                        // Ignore returns
+                        continue;
+                    }
                     if (target->interproc()) {
                         // Possible calling a GOT using indirect call
-                        // Ignore PLTs and RET
-                        if (target->sinkEdge() &&
-                            !this->PLT.contains(bb->last()) &&
-                            target->type() != Dyninst::ParseAPI::EdgeTypeEnum::RET) {
+                        // Ignore PLTs
+                        if (target->sinkEdge() && !this->PLT.contains(bb->last())) {
                             // Decode
                             const auto out_addr = bb->last();
                             const auto instr = bb->getInsn(bb->last());
@@ -359,7 +363,10 @@ struct ELF {
                 const auto& [key, val] = in;
                 return key->out() == syscall_reg;
             });
-        assert(syscall_nbr_assign.get() != nullptr && "syscall_nbr_assign is null");
+
+        if (syscall_nbr_assign.get() == nullptr) {
+            return {};
+        }
 
         // Resolve is using the custom AST visitor
         SyscallNumberVisitor visitor;
@@ -422,10 +429,13 @@ struct ELF {
             if (callee->name() == func->name() && callee->addr() == func->addr()) {
                 continue;  // prevent recursive call
             } else if (this->PLT.contains(callee->addr())) {
+                spdlog::debug("PLT {} has a edge to {:}", func->name(), *PLT[callee->addr()].symbols.cbegin());
                 this->cfg[func].dynamic.emplace(callee->addr());
             } else if (this->GOT.contains(callee->addr())) {
+                spdlog::debug("GOT {} has a edge to {:}", func->name(), *GOT[callee->addr()].symbols.cbegin());
                 this->cfg[func].dynamic.emplace(callee->addr());
             } else {
+                spdlog::debug("STATIC {} has a edge to {:}", func->name(), callee->name());
                 this->cfg[func].static_.emplace(callee);
             }
         }
@@ -433,16 +443,29 @@ struct ELF {
 
     static void traverse_called_funcs(const auto& object, const auto& symbol, auto& func_callback, auto& syscall_callback, auto& bogus_callback, std::set<std::pair<std::string, Dyninst::Address>>& seen, const int layer) {
         const auto& elf = ELFCache.at(object);
-        const auto& func = [&] {
+        const auto func = [&] {
             if constexpr (std::is_same_v<Dyninst::ParseAPI::Function*, std::decay_t<decltype(symbol)>>) {
                 return symbol;
             } else if constexpr (std::is_same_v<std::set<std::string>, std::decay_t<decltype(symbol)>>) {
                 const auto rsymbol = *symbol.cbegin();
-                return elf.function_name_map.at(rsymbol);
+                if (elf.function_name_map.contains(rsymbol)) {
+                    return elf.function_name_map.at(rsymbol);
+                } else {
+                    spdlog::error("Failed to find function {} in {}", rsymbol, object);
+                    return static_cast<Dyninst::ParseAPI::Function*>(nullptr);
+                }
             } else {
-                return elf.function_name_map.at(symbol);
+                if (elf.function_name_map.contains(symbol)) {
+                    return elf.function_name_map.at(symbol);
+                } else {
+                    spdlog::error("Failed to find function {} in {}", symbol, object);
+                    return static_cast<Dyninst::ParseAPI::Function*>(nullptr);
+                }
             }
         }();
+
+        if (func == nullptr)
+            return;
 
         // Prevent Loop
         const auto current = std::make_pair(object, func->addr());
