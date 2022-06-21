@@ -96,7 +96,7 @@ int main(const int argc, const char *argv[]) {
     const auto func_printer = [&](const auto layer, const auto& object, const auto& func) {
         //if (func->name().starts_with("targ"))
             //return;
-        spdlog::info("{3: <{4}}{0} {1} {2:x}", object, func->name(), func->addr(), "", layer);
+        //spdlog::info("{3: <{4}}{0} {1} {2:x}", object, func->name(), func->addr(), "", layer);
     };
 
     const auto syscall_printer = [&](const auto layer, const auto& object, const auto& func, const auto syscall_nbr) {

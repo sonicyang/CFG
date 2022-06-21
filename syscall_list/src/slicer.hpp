@@ -1,5 +1,7 @@
 #pragma once
 
+#include <deque>
+
 #include "CFG.h"
 #include "CodeObject.h"
 #include "Function.h"
@@ -23,14 +25,22 @@ public:
 };
 
 class SyscallNumberPredicates : public Dyninst::Slicer::Predicates {
+    std::deque<Dyninst::ParseAPI::Function*> callstack;
 public:
-    /* Ugly hack to clear system call register to 0
-     * Because x86-64 uses eax only but dyninst thinks in rax and cannot infer bits 32:64 */
-    virtual bool addNodeCallback(Dyninst::Assignment::Ptr ap, std::set<Dyninst::ParseAPI::Edge*>&) {
-        /* If the syscall register referes to its self solely, set it to 0 */
-        if (ap->inputs().size() == 0 && ap->out() == Dyninst::AbsRegion(Dyninst::x86_64::rax)) {
-            ap->addInput(Dyninst::AbsRegion(Dyninst::Absloc(0x0)));
+    SyscallNumberPredicates(const auto& callstack_) : callstack(callstack_) {}
+    virtual std::vector<Dyninst::ParseAPI::Function*> followCallBackward(Dyninst::ParseAPI::Block* caller, CallStack_t& cs, Dyninst::AbsRegion argument) {
+        callstack.pop_back();
+        if (!callstack.empty()) {
+            const auto target = callstack.back();
+            spdlog::info("Backtracking... {}", target->name());
+            return std::vector{target};
+        } else {
+            return {};
         }
+    }
+
+    virtual bool addPredecessor(Dyninst::AbsRegion reg) {
+        spdlog::info("Pred...");
         return true;
     }
 };

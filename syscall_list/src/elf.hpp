@@ -11,6 +11,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <deque>
 #include <tuple>
 
 #include "spdlog/spdlog.h"
@@ -92,7 +93,7 @@ struct ELF {
     struct CallDest {
         std::set<Dyninst::ParseAPI::Function*> static_;
         std::set<Dyninst::Address> dynamic;
-        std::set<Dyninst::Address> syscall;
+        bool do_syscall = false;
     };
 
     std::map<Dyninst::ParseAPI::Function*, CallDest> cfg;
@@ -118,14 +119,14 @@ struct ELF {
         }
     }
 
-    auto is_syscall(const auto& instr) {
+    static auto is_syscall(const auto& instr) {
         const std::regex syscall("syscall.*", std::regex::extended);
         std::smatch match;
         const auto instr_str = instr.format();
         return std::regex_match(instr_str, match, syscall);
     }
 
-    auto make_assignments(const auto& func, const auto& bb, const auto& addr, const auto& instr) {
+    static auto make_assignments(const auto& func, const auto& bb, const auto& addr, const auto& instr) {
         // Convert the instruction to assignments
         Dyninst::AssignmentConverter ac(true, true);
         std::vector<Dyninst::Assignment::Ptr> assignments;
@@ -133,7 +134,8 @@ struct ELF {
         return assignments;
     }
 
-    auto parse_syscall(const auto& func, const auto& bb, const auto& addr, const auto& instr) -> std::optional<Dyninst::Address> {
+   static auto parse_syscall(const auto& func, const auto& bb, const auto& addr, const auto& instr, const auto& callstack) -> std::optional<Dyninst::Address> {
+        spdlog::info("BB @ {:x} size {}", bb->start(), bb->sources().size());
         // Fake a assignment of rax -> rax
         Dyninst::AbsRegion syscall_reg(Dyninst::MachRegister::getSyscallNumberReg(func->region()->getArch()));
         auto syscall_assign = Dyninst::Assignment::makeAssignment(instr, addr, func, bb, syscall_reg);
@@ -141,7 +143,7 @@ struct ELF {
 
         // Create a Slicer that will start from the given assignment
         Dyninst::Slicer s(syscall_assign, bb, func);
-        Dyninst::Slicer::Predicates mp;
+        SyscallNumberPredicates mp{callstack};
         const auto slice = s.backwardSlice(mp);
 
         // Expand the expression
@@ -168,6 +170,24 @@ struct ELF {
         } else {
             return {};
         }
+    }
+
+    static auto parse_syscall(const auto& func, const auto& callstack) {
+        std::set<Dyninst::Address> ret;
+        for (const auto& bb : func->blocks()) {
+            const auto instr = bb->getInsn(bb->last());
+            if(is_syscall(instr)) {
+                const auto out_addr = bb->last();
+                const auto syscall_nbr = parse_syscall(func, bb, out_addr, instr, callstack);
+                if (syscall_nbr) {
+                    spdlog::debug("Syscall({}) detected! {} @ {:x}", syscall_nbr.value(), func->name(), out_addr);
+                    ret.emplace(syscall_nbr.value());
+                } else {
+                    spdlog::warn("Syscall number decode failed {} @ {:x}", func->name(), out_addr);
+                }
+            }
+        }
+        return ret;
     }
 
     auto parse_external_call(const auto& func, const auto& bb) -> std::optional<Dyninst::Address> {
@@ -232,7 +252,8 @@ struct ELF {
         }
     }
 
-    static void traverse_called_funcs(const auto& object, const auto& symbol, auto& func_callback, auto& syscall_callback, auto& bogus_callback, std::set<std::pair<std::string, Dyninst::Address>>& seen, const int layer) {
+    static void traverse_called_funcs(const auto& object, const auto& symbol, auto& func_callback, auto& syscall_callback, auto& bogus_callback,
+        std::set<std::pair<std::string, Dyninst::Address>>& seen, std::deque<Dyninst::ParseAPI::Function*>& callstack) {
         auto elf = ELFCache::get().find(object);
         const auto func = [&] {
             if constexpr (std::is_same_v<Dyninst::ParseAPI::Function*, std::decay_t<decltype(symbol)>>) {
@@ -265,7 +286,11 @@ struct ELF {
         }
         seen.emplace(current);
 
+        const auto layer = callstack.size();
+
         func_callback(layer, object, func);
+
+        callstack.push_back(func);
 
         // resolve the cfg
         elf.resolve(func);
@@ -275,11 +300,14 @@ struct ELF {
         }
 
         const auto next_level = [&](const auto& obj, const auto sym) {
-            traverse_called_funcs(obj, sym, func_callback, syscall_callback, bogus_callback, seen, layer + 1);
+            traverse_called_funcs(obj, sym, func_callback, syscall_callback, bogus_callback, seen, callstack);
         };
 
-        for (const auto& syscall_nbr : elf.cfg.at(func).syscall) {
-            syscall_callback(layer + 1, object, func, syscall_nbr);
+        if (elf.cfg[func].do_syscall) {
+            const auto syscalls = parse_syscall(func, callstack);
+            for (const auto& syscall_nbr : syscalls) {
+                syscall_callback(layer + 1, object, func, syscall_nbr);
+            }
         }
         for (const auto& callee : elf.cfg.at(func).static_) {
             next_level(object, callee);
@@ -295,6 +323,8 @@ struct ELF {
                 bogus_callback(layer + 1, object, func, addr);
             }
         }
+
+        callstack.pop_back();
     }
 
  public:
@@ -487,13 +517,7 @@ struct ELF {
                         spdlog::debug("DynInst failed to auto decode edge {:x}: {}", out_addr, instr.format());
 
                         if(is_syscall(instr)) {
-                            const auto syscall_nbr = parse_syscall(func, bb, out_addr, instr);
-                            if (syscall_nbr) {
-                                spdlog::debug("Syscall({}) detected! {} @ {:x}", syscall_nbr.value(), name, out_addr);
-                                this->cfg[func].syscall.emplace(syscall_nbr.value());
-                            } else {
-                                spdlog::warn("Syscall number decode failed {} @ {:x}", name, out_addr);
-                            }
+                            this->cfg[func].do_syscall = true;
                         } else {  // Not syscall
                             const auto callee_addr = parse_external_call(func, bb);
                             if (callee_addr) {
@@ -518,7 +542,8 @@ struct ELF {
 
     static void traverse_called_funcs(const auto& object, const auto& symbol, auto& func_callback, auto& syscall_callback, auto& bogus_callback) {
         std::set<std::pair<std::string, Dyninst::Address>> seen;
-        traverse_called_funcs(object, symbol, func_callback, syscall_callback, bogus_callback, seen, 0);
+        std::deque<Dyninst::ParseAPI::Function*> callstack;
+        traverse_called_funcs(object, symbol, func_callback, syscall_callback, bogus_callback, seen, callstack);
     }
 };
 
