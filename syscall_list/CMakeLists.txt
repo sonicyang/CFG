@@ -18,4 +18,4 @@ target_link_libraries(syscall_list
                       spdlog::spdlog
                       )
 
-target_compile_options(syscall_list PRIVATE -Wextra -Wall -Werror -Wno-unused-parameter)
+target_compile_options(syscall_list PRIVATE -Wextra -Wall -Werror -Wno-unused-parameter) #-Wno-maybe-uninitialized -O1)

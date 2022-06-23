@@ -135,7 +135,6 @@ struct ELF {
     }
 
    static auto parse_syscall(const auto& func, const auto& bb, const auto& addr, const auto& instr, const auto& callstack) -> std::optional<Dyninst::Address> {
-        spdlog::info("BB @ {:x} size {}", bb->start(), bb->sources().size());
         // Fake a assignment of rax -> rax
         Dyninst::AbsRegion syscall_reg(Dyninst::MachRegister::getSyscallNumberReg(func->region()->getArch()));
         auto syscall_assign = Dyninst::Assignment::makeAssignment(instr, addr, func, bb, syscall_reg);

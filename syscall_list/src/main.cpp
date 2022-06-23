@@ -24,6 +24,7 @@
 #include "Function.h"
 #include "Instruction.h"
 #include "InstructionDecoder.h"
+#include "Symtab.h"
 
 #include "elf.hpp"
 #include "syscall_table.h"
@@ -60,7 +61,7 @@ static inline auto init_logging() {
     }
 }
 
-int main(const int argc, const char *argv[]) {
+int main(const int argc, char *argv[]) {
     if (argc < 2) {
         std::cerr << "Usage: " << argv[0] << " <executable> <args...>\n";
         return -1;
@@ -68,9 +69,20 @@ int main(const int argc, const char *argv[]) {
 
     init_logging();
 
+    //spdlog::info("Create symtab from {}", argv[1]);
+
+    //const auto code_source = std::make_unique<ParseAPI::SymtabCodeSource>(argv[1]);
+    //const auto code_object = std::make_unique<ParseAPI::CodeObject>(code_source.get());
+    //std::vector<SymtabAPI::Module*> modules;
+    //const auto a = code_source->getSymtabObject()->getAllModules(modules);
+    //spdlog::info("Ms: {}", a);
+    //for (const auto& m : modules) {
+        //spdlog::info("M: {}", m->fullName());
+    //}
+
     spdlog::info("Create process from {}", argv[1]);
-    const auto process = bp.processCreate(argv[1], argv + 2);
-    process->stopExecution();
+    const auto process = bp.openBinary(argv[1]);
+    //process->stopExecution();
 
     const auto image = process->getImage();
 
@@ -124,8 +136,8 @@ int main(const int argc, const char *argv[]) {
                 for (auto&[obj, func] : syscalls[nbr]) {
                     callers += fmt::format("{}@{}  ", func->name(), obj);
                 }
+                spdlog::info("{0:<3}{1:<4}{2:<25} : {3:}", yes ? "o" : "", nbr, str.value(), callers);
             }
-            spdlog::info("{0:<3}{1:<4}{2:<25} : {3:}", yes ? "o" : "", nbr, str.value(), callers);
         }
     }
 }

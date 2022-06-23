@@ -32,7 +32,6 @@ public:
         callstack.pop_back();
         if (!callstack.empty()) {
             const auto target = callstack.back();
-            spdlog::info("Backtracking... {}", target->name());
             return std::vector{target};
         } else {
             return {};
@@ -40,7 +39,6 @@ public:
     }
 
     virtual bool addPredecessor(Dyninst::AbsRegion reg) {
-        spdlog::info("Pred...");
         return true;
     }
 };
