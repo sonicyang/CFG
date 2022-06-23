@@ -69,20 +69,8 @@ int main(const int argc, char *argv[]) {
 
     init_logging();
 
-    //spdlog::info("Create symtab from {}", argv[1]);
-
-    //const auto code_source = std::make_unique<ParseAPI::SymtabCodeSource>(argv[1]);
-    //const auto code_object = std::make_unique<ParseAPI::CodeObject>(code_source.get());
-    //std::vector<SymtabAPI::Module*> modules;
-    //const auto a = code_source->getSymtabObject()->getAllModules(modules);
-    //spdlog::info("Ms: {}", a);
-    //for (const auto& m : modules) {
-        //spdlog::info("M: {}", m->fullName());
-    //}
-
     spdlog::info("Create process from {}", argv[1]);
     const auto process = bp.openBinary(argv[1]);
-    //process->stopExecution();
 
     const auto image = process->getImage();
 
