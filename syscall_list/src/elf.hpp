@@ -123,8 +123,13 @@ struct ELF {
     static auto is_syscall(const auto& instr) {
         const std::regex syscall("syscall.*", std::regex::extended);
         std::smatch match;
-        const auto instr_str = instr.format();
-        return std::regex_match(instr_str, match, syscall);
+        if (instr.getArch() != Dyninst::Arch_none) {
+            const auto instr_str = instr.format();
+            return std::regex_match(instr_str, match, syscall);
+        } else {
+            spdlog::error("Failed to decode an instruction!");
+            return false;
+        }
     }
 
     static auto make_assignments(const auto& func, const auto& bb, const auto& addr, const auto& instr) {
@@ -578,10 +583,21 @@ struct ELF {
         }
     }
 
-    static void traverse_called_funcs(const auto& object, const auto& symbol, auto& func_callback, auto& syscall_callback, auto& bogus_callback, auto& bogus_syscall_callback) {
+    static void traverse_called_funcs(const auto& object, const auto& symbols, auto& func_callback, auto& syscall_callback, auto& bogus_callback, auto& bogus_syscall_callback) {
         std::set<std::pair<std::string, Dyninst::Address>> seen;
-        std::deque<Dyninst::ParseAPI::Function*> callstack;
-        traverse_called_funcs(object, symbol, func_callback, syscall_callback, bogus_callback, bogus_syscall_callback, seen, callstack);
+        for (const auto& symbol: symbols) {
+            std::deque<Dyninst::ParseAPI::Function*> callstack;
+            traverse_called_funcs(object, symbol, func_callback, syscall_callback, bogus_callback, bogus_syscall_callback, seen, callstack);
+        }
+    }
+
+    static void traverse_called_funcs(const auto& object, auto& func_callback, auto& syscall_callback, auto& bogus_callback, auto& bogus_syscall_callback) {
+        std::set<std::pair<std::string, Dyninst::Address>> seen;
+        const auto elf = ELFCache::get().find(object);
+        for (const auto& func : elf.functions) {
+            std::deque<Dyninst::ParseAPI::Function*> callstack;
+            traverse_called_funcs(object, func, func_callback, syscall_callback, bogus_callback, bogus_syscall_callback, seen, callstack);
+        }
     }
 };
 

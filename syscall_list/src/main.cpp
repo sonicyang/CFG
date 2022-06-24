@@ -11,6 +11,10 @@
 #include <fmt/format.h>
 #include <spdlog/spdlog.h>
 
+#include <absl/flags/flag.h>
+#include <absl/flags/parse.h>
+#include <absl/flags/usage.h>
+
 #include "BPatch.h"
 #include "BPatch_addressSpace.h"
 #include "BPatch_process.h"
@@ -28,6 +32,9 @@
 
 #include "elf.hpp"
 #include "syscall_table.h"
+
+ABSL_FLAG(bool, lib, false, "Is a shared library");
+ABSL_FLAG(std::string, entry, "main", "Entry for executable");
 
 namespace ParseAPI = Dyninst::ParseAPI;
 namespace SymtabAPI = Dyninst::SymtabAPI;
@@ -62,17 +69,25 @@ static inline auto init_logging() {
 }
 
 int main(const int argc, char *argv[]) {
-    if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <executable> <args...>\n";
+    absl::SetProgramUsageMessage(fmt::format("Usage: {} <options> <ELF>\n", argv[0]));
+    const auto args = absl::ParseCommandLine(argc, argv);
+    if (args.size() < 2) {
+        std::cerr << absl::ProgramUsageMessage();
         return -1;
     }
 
     init_logging();
 
-    spdlog::info("Create process from {}", argv[1]);
-    const auto process = bp.openBinary(argv[1]);
+    const auto filename = *(args.cbegin() + 1);
 
-    const auto image = process->getImage();
+    spdlog::info("Create process from {}", filename);
+    const auto bin = bp.openBinary(filename, false);
+
+    if (bin == nullptr) {
+        spdlog::error("Failed to open {}", filename);
+    }
+
+    const auto image = bin->getImage();
 
     std::vector<BPatch_object*> objs;
     image->getObjects(objs);
@@ -80,16 +95,15 @@ int main(const int argc, char *argv[]) {
 
     ELFCache::get().set_modules(image->getModules());
 
-    // Assume the last one is the executable
+    const auto islib = absl::GetFlag(FLAGS_lib);
+
+    // Assume the last one is the input
     const auto& exe_obj = *(objs.cend() - 1);
     const auto exe_name = exe_obj->name();
     const auto exe_path = exe_obj->pathName();
 
     /* Create the cache for the exe*/
     ELFCache::get().find(exe_name, exe_path);
-
-    /* Entry point, assume as _start */
-    constexpr auto entry_name = "main";
 
     std::map<Dyninst::Address, std::vector<std::pair<std::string, Dyninst::ParseAPI::Function*>>> syscalls;
     std::vector<std::string> bad_syscalls;
@@ -114,7 +128,22 @@ int main(const int argc, char *argv[]) {
         bad_syscalls.emplace_back(fmt::format("{}@{}", func->name(), object));
     };
 
-    ELF::traverse_called_funcs(exe_name, entry_name, func_printer, syscall_printer, bogus_printer, bogus_syscall_printer);
+    if (islib) {
+        spdlog::info("{} is an shared library, scanning all functions", filename);
+
+        ELF::traverse_called_funcs(exe_name, func_printer, syscall_printer, bogus_printer, bogus_syscall_printer);
+
+    } else {
+        const auto entry_name = absl::GetFlag(FLAGS_entry);
+        spdlog::info("{} is an executable, using {} as entry point", filename, entry_name);
+
+        const std::string entries[] = {
+            "_start",
+            entry_name
+        };
+
+        ELF::traverse_called_funcs(exe_name, entries, func_printer, syscall_printer, bogus_printer, bogus_syscall_printer);
+    }
 
     constexpr auto max_nbr = 512;
     spdlog::info("");

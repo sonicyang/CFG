@@ -42,6 +42,8 @@ find_package(Dyninst REQUIRED
                         symtabAPI
                         common)
 
+find_package(absl REQUIRED)
+
 find_package(spdlog REQUIRED)
 
 # Read the cache generated from building Dyninst
