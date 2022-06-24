@@ -92,10 +92,11 @@ int main(const int argc, char *argv[]) {
     constexpr auto entry_name = "main";
 
     std::map<Dyninst::Address, std::vector<std::pair<std::string, Dyninst::ParseAPI::Function*>>> syscalls;
+    std::vector<std::string> bad_syscalls;
 
     const auto func_printer = [&](const auto layer, const auto& object, const auto& func) {
-        //if (func->name().starts_with("targ"))
-            //return;
+        //if (func->name() == "syscall")
+            //spdlog::info("Call to syscall(3) detected!");
         //spdlog::info("{3: <{4}}{0} {1} {2:x}", object, func->name(), func->addr(), "", layer);
     };
 
@@ -108,7 +109,12 @@ int main(const int argc, char *argv[]) {
         //spdlog::info("{2: <{3}}Bogus call {0} {1:x}", object, addr, "", layer);
     };
 
-    ELF::traverse_called_funcs(exe_name, entry_name, func_printer, syscall_printer, bogus_printer);
+    const auto bogus_syscall_printer = [&](const auto layer, const auto& object, const auto& func) {
+        //spdlog::info("{2: <{3}}Bogus call {0} {1:x}", object, addr, "", layer);
+        bad_syscalls.emplace_back(fmt::format("{}@{}", func->name(), object));
+    };
+
+    ELF::traverse_called_funcs(exe_name, entry_name, func_printer, syscall_printer, bogus_printer, bogus_syscall_printer);
 
     constexpr auto max_nbr = 512;
     spdlog::info("");
@@ -127,5 +133,14 @@ int main(const int argc, char *argv[]) {
                 spdlog::info("{0:<3}{1:<4}{2:<25} : {3:}", yes ? "o" : "", nbr, str.value(), callers);
             }
         }
+    }
+    spdlog::info("=========================");
+    {
+        std::string callers{};
+        for (const auto& bad_call : bad_syscalls) {
+            callers += bad_call + "  ";
+        }
+        spdlog::info("Failed to decode system call in:");
+        spdlog::info("  {}", callers);
     }
 }

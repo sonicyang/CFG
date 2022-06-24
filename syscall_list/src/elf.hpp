@@ -24,6 +24,7 @@
 #include "BPatch_function.h"
 #include "BPatch_point.h"
 #include "BPatch_flowGraph.h"
+#include "ABI.h"
 #include "CFG.h"
 #include "CodeObject.h"
 #include "Function.h"
@@ -60,8 +61,8 @@ struct ELFCache {
         throw std::runtime_error(name + " not found!");
     }
 
-    inline auto find(const std::string& name);
-    inline auto find(const std::string& name, const std::string& path);
+    inline auto& find(const std::string& name);
+    inline auto& find(const std::string& name, const std::string& path);
 
     inline auto set_modules(auto* modules) {
         this->m = modules;
@@ -91,8 +92,8 @@ struct ELF {
     std::map<Dyninst::Address, Dyninst::Address> rela_plt_table;
 
     struct CallDest {
-        std::set<Dyninst::ParseAPI::Function*> static_;
-        std::set<Dyninst::Address> dynamic;
+        std::set<std::pair<Dyninst::Address, Dyninst::ParseAPI::Function*>> static_;
+        std::set<std::pair<Dyninst::Address, Dyninst::Address>> dynamic;
         bool do_syscall = false;
     };
 
@@ -134,9 +135,9 @@ struct ELF {
         return assignments;
     }
 
-   static auto parse_syscall(const auto& func, const auto& bb, const auto& addr, const auto& instr, const auto& callstack) -> std::optional<Dyninst::Address> {
+   static auto parse_syscall(const auto reg, const auto& func, const auto& bb, const auto& addr, const auto& instr, const auto& callstack) -> std::optional<Dyninst::Address> {
         // Fake a assignment of rax -> rax
-        Dyninst::AbsRegion syscall_reg(Dyninst::MachRegister::getSyscallNumberReg(func->region()->getArch()));
+        Dyninst::AbsRegion syscall_reg(reg);
         auto syscall_assign = Dyninst::Assignment::makeAssignment(instr, addr, func, bb, syscall_reg);
         syscall_assign->addInput(syscall_reg);
 
@@ -175,14 +176,34 @@ struct ELF {
         std::set<Dyninst::Address> ret;
         for (const auto& bb : func->blocks()) {
             const auto instr = bb->getInsn(bb->last());
-            if(is_syscall(instr)) {
+            if (is_syscall(instr)) {
                 const auto out_addr = bb->last();
-                const auto syscall_nbr = parse_syscall(func, bb, out_addr, instr, callstack);
+                const auto reg = Dyninst::MachRegister::getSyscallNumberReg(func->region()->getArch());
+                const auto syscall_nbr = parse_syscall(reg, func, bb, out_addr, instr, callstack);
                 if (syscall_nbr) {
                     spdlog::debug("Syscall({}) detected! {} @ {:x}", syscall_nbr.value(), func->name(), out_addr);
                     ret.emplace(syscall_nbr.value());
                 } else {
                     spdlog::warn("Syscall number decode failed {} @ {:x}", func->name(), out_addr);
+                }
+            }
+        }
+        return ret;
+    }
+
+    static auto parse_syscall_func(const auto& caller, const auto calling_addr, const auto& callstack) {
+        std::set<Dyninst::Address> ret;
+        for (const auto& bb : caller->blocks()) {
+            const auto out_addr = bb->last();
+            if (out_addr == calling_addr) {
+                const auto instr = bb->getInsn(bb->last());
+                const auto reg = x86_64::rdi;  // XXX: hardcoded for x86, 1st argument register
+                const auto syscall_nbr = parse_syscall(reg, caller, bb, out_addr, instr, callstack);
+                if (syscall_nbr) {
+                    spdlog::debug("Syscall({}) detected! {} @ {:x}", syscall_nbr.value(), caller->name(), out_addr);
+                    ret.emplace(syscall_nbr.value());
+                } else {
+                    spdlog::warn("Syscall number decode failed {} @ {:x}", caller->name(), out_addr);
                 }
             }
         }
@@ -232,7 +253,7 @@ struct ELF {
         return {};
     }
 
-    auto parse_internal_call(const auto& func, const auto& target) {
+    auto parse_internal_call(const auto& func, const auto out_addr, const auto& target) {
         std::vector<Dyninst::ParseAPI::Function*> callees;
         target->trg()->getFuncs(callees);
         for (auto& callee : callees) {
@@ -240,18 +261,18 @@ struct ELF {
                 continue;  // prevent recursive call
             } else if (this->PLT.contains(callee->addr())) {
                 spdlog::debug("PLT {} has a edge to {:}", func->name(), *PLT[callee->addr()].symbols.cbegin());
-                this->cfg[func].dynamic.emplace(callee->addr());
+                this->cfg[func].dynamic.emplace(out_addr, callee->addr());
             } else if (this->GOT.contains(callee->addr())) {
                 spdlog::debug("GOT {} has a edge to {:}", func->name(), *GOT[callee->addr()].symbols.cbegin());
-                this->cfg[func].dynamic.emplace(callee->addr());
+                this->cfg[func].dynamic.emplace(out_addr, callee->addr());
             } else {
                 spdlog::debug("STATIC {} has a edge to {:}", func->name(), callee->name());
-                this->cfg[func].static_.emplace(callee);
+                this->cfg[func].static_.emplace(out_addr, callee);
             }
         }
     }
 
-    static void traverse_called_funcs(const auto& object, const auto& symbol, auto& func_callback, auto& syscall_callback, auto& bogus_callback,
+    static void traverse_called_funcs(const auto& object, const auto& symbol, auto& func_callback, auto& syscall_callback, auto& bogus_callback, auto& bogus_syscall_callback,
         std::set<std::pair<std::string, Dyninst::Address>>& seen, std::deque<Dyninst::ParseAPI::Function*>& callstack) {
         auto elf = ELFCache::get().find(object);
         const auto func = [&] {
@@ -289,8 +310,6 @@ struct ELF {
 
         func_callback(layer, object, func);
 
-        callstack.push_back(func);
-
         // resolve the cfg
         elf.resolve(func);
 
@@ -298,8 +317,10 @@ struct ELF {
             return;  // Don't call anything
         }
 
+        callstack.push_back(func);
+
         const auto next_level = [&](const auto& obj, const auto sym) {
-            traverse_called_funcs(obj, sym, func_callback, syscall_callback, bogus_callback, seen, callstack);
+            traverse_called_funcs(obj, sym, func_callback, syscall_callback, bogus_callback, bogus_syscall_callback, seen, callstack);
         };
 
         if (elf.cfg[func].do_syscall) {
@@ -307,16 +328,34 @@ struct ELF {
             for (const auto& syscall_nbr : syscalls) {
                 syscall_callback(layer + 1, object, func, syscall_nbr);
             }
+            if (!syscalls.size()) {
+                bogus_syscall_callback(layer, object, func);
+            }
         }
-        for (const auto& callee : elf.cfg.at(func).static_) {
+        for (const auto&[out_addr, callee] : elf.cfg.at(func).static_) {
+            if (object.starts_with("libc") && callee->name() == "syscall") {
+                spdlog::debug("Special handing for syscall(3)");
+                // parse the 1st register into syscall
+                const auto syscalls = parse_syscall_func(func, out_addr, callstack);
+                for (const auto& syscall_nbr : syscalls) {
+                    syscall_callback(layer + 1, object, func, syscall_nbr);
+                }
+            }
             next_level(object, callee);
         }
-        for (const auto& addr : elf.cfg.at(func).dynamic) {
-            if (elf.GOT.contains(addr)) {
-                const auto callee = elf.GOT.at(addr);
-                next_level(callee.object, callee.symbols);
-            } else if (elf.PLT.contains(addr)) {
-                const auto callee = elf.PLT.at(addr);
+        for (const auto&[out_addr, addr] : elf.cfg.at(func).dynamic) {
+            const auto isGOT = elf.GOT.contains(addr);
+            if (isGOT || elf.PLT.contains(addr)) {
+                const auto& tab = isGOT ? elf.GOT : elf.PLT;
+                const auto callee = tab.at(addr);
+                if (callee.object.starts_with("libc") && callee.symbols.contains("syscall")) {
+                    spdlog::debug("Special handing for syscall(3)");
+                    // parse the 1st register into syscall
+                    const auto syscalls = parse_syscall_func(func, out_addr, callstack);
+                    for (const auto& syscall_nbr : syscalls) {
+                        syscall_callback(layer + 1, object, func, syscall_nbr);
+                    }
+                }
                 next_level(callee.object, callee.symbols);
             } else {
                 bogus_callback(layer + 1, object, func, addr);
@@ -506,12 +545,12 @@ struct ELF {
                     // Ignore returns
                     continue;
                 }
+                const auto out_addr = bb->last();
                 if (target->interproc()) {
                     // Possible calling a GOT using indirect call
                     // Ignore PLTs
                     if (target->sinkEdge() && !this->PLT.contains(bb->last())) {
                         // Decode
-                        const auto out_addr = bb->last();
                         const auto instr = bb->getInsn(bb->last());
                         spdlog::debug("DynInst failed to auto decode edge {:x}: {}", out_addr, instr.format());
 
@@ -523,30 +562,30 @@ struct ELF {
                                 spdlog::debug("{} @ {:x} BB target AST resolved as a edge to {:x}", name, out_addr, callee_addr.value());
                                 if (this->rela_plt_table.contains(callee_addr.value())) {
                                     /* Redirected by PLT.GOT entry */
-                                    this->cfg[func].dynamic.emplace(this->rela_plt_table[callee_addr.value()]);
+                                    this->cfg[func].dynamic.emplace(out_addr, this->rela_plt_table[callee_addr.value()]);
                                 } else {
-                                    this->cfg[func].dynamic.emplace(callee_addr.value());
+                                    this->cfg[func].dynamic.emplace(out_addr, callee_addr.value());
                                 }
                             } else {
                                 spdlog::warn("{} @ {:x} {} BB target AST resolution Failed!", name, out_addr, instr.format());
                             }
                         } // End indirect call and syscall
                     } else {
-                        parse_internal_call(func, target);
+                        parse_internal_call(func, out_addr, target);
                     }
                 }
             }
         }
     }
 
-    static void traverse_called_funcs(const auto& object, const auto& symbol, auto& func_callback, auto& syscall_callback, auto& bogus_callback) {
+    static void traverse_called_funcs(const auto& object, const auto& symbol, auto& func_callback, auto& syscall_callback, auto& bogus_callback, auto& bogus_syscall_callback) {
         std::set<std::pair<std::string, Dyninst::Address>> seen;
         std::deque<Dyninst::ParseAPI::Function*> callstack;
-        traverse_called_funcs(object, symbol, func_callback, syscall_callback, bogus_callback, seen, callstack);
+        traverse_called_funcs(object, symbol, func_callback, syscall_callback, bogus_callback, bogus_syscall_callback, seen, callstack);
     }
 };
 
-inline auto ELFCache::find(const std::string& name, const std::string& path) {
+inline auto& ELFCache::find(const std::string& name, const std::string& path) {
     /* Recursively resolve any dynamic libraries, avoid recursive to our self */
     if (!this->cache.contains(name)) {
         this->cache.emplace(name, ELF(path, name, *m));
@@ -554,7 +593,7 @@ inline auto ELFCache::find(const std::string& name, const std::string& path) {
     return this->cache[name];
 }
 
-inline auto ELFCache::find(const std::string& name) {
+inline auto& ELFCache::find(const std::string& name) {
     /* Recursively resolve any dynamic libraries, avoid recursive to our self */
     if (!this->cache.contains(name)) {
         const auto path = findLib(name);
