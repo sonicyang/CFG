@@ -149,6 +149,11 @@ int main(const int argc, char *argv[]) {
     spdlog::info("");
     spdlog::info("");
     spdlog::info("=========================");
+    spdlog::info("Scanned ELFs:");
+    for (const auto&[name, elf] : ELFCache::get().getAll()) {
+        spdlog::info("  {}", name);
+    }
+    spdlog::info("=========================");
     spdlog::info("Syscall statistic:");
     for (auto nbr = 0; nbr < max_nbr; nbr++) {
         const auto str = syscall_name(nbr);

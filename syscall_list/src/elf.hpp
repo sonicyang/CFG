@@ -68,6 +68,9 @@ struct ELFCache {
         this->m = modules;
     }
 
+    inline const auto& getAll() {
+        return cache;
+    }
  private:
     ELFCache() {};
     static inline std::map<std::string, ELF> cache;
