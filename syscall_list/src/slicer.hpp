@@ -29,8 +29,8 @@ class SyscallNumberPredicates : public Dyninst::Slicer::Predicates {
 public:
     SyscallNumberPredicates(const auto& callstack_) : callstack(callstack_) {}
     virtual std::vector<Dyninst::ParseAPI::Function*> followCallBackward(Dyninst::ParseAPI::Block* caller, CallStack_t& cs, Dyninst::AbsRegion argument) {
-        callstack.pop_back();
-        if (!callstack.empty()) {
+        if (callstack.size() >= 2) {
+            callstack.pop_back();
             const auto target = callstack.back();
             return std::vector{target};
         } else {
