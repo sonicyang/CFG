@@ -1,5 +1,6 @@
 #include <deque>
 #include <iostream>
+#include <filesystem>
 #include <memory>
 #include <set>
 #include <string>
@@ -9,6 +10,7 @@
 #include <vector>
 
 #include <fmt/format.h>
+#include <fmt/os.h>
 #include <spdlog/spdlog.h>
 
 #include <absl/flags/flag.h>
@@ -35,6 +37,7 @@
 
 ABSL_FLAG(bool, lib, false, "Is a shared library");
 ABSL_FLAG(std::string, entry, "main", "Entry for executable");
+ABSL_FLAG(std::string, output, "", "Report filename");
 
 namespace ParseAPI = Dyninst::ParseAPI;
 namespace SymtabAPI = Dyninst::SymtabAPI;
@@ -79,6 +82,8 @@ int main(const int argc, char *argv[]) {
     init_logging();
 
     const auto filename = *(args.cbegin() + 1);
+    const auto report_name = absl::GetFlag(FLAGS_output) == "" ?
+        std::filesystem::path{filename}.filename().string() + ".report" : absl::GetFlag(FLAGS_output);
 
     spdlog::info("Create process from {}", filename);
     const auto bin = bp.openBinary(filename, false);
@@ -138,23 +143,27 @@ int main(const int argc, char *argv[]) {
         spdlog::info("{} is an executable, using {} as entry point", filename, entry_name);
 
         const std::string entries[] = {
-            "_start",
+            //"_start",
             entry_name
         };
 
         ELF::traverse_called_funcs(exe_name, entries, func_printer, syscall_printer, bogus_printer, bogus_syscall_printer);
     }
 
+
+    spdlog::info("Output report as {}", report_name);
+    auto report = fmt::output_file(report_name);
     constexpr auto max_nbr = 512;
-    spdlog::info("");
-    spdlog::info("");
-    spdlog::info("=========================");
-    spdlog::info("Scanned ELFs:");
+    report.print("File: {}\n", filename);
+
+    report.print("Scanned ELFs: ");
     for (const auto&[name, elf] : ELFCache::get().getAll()) {
-        spdlog::info("  {}", name);
+        report.print("{} ", name);
     }
-    spdlog::info("=========================");
-    spdlog::info("Syscall statistic:");
+    report.print("\n");
+
+    report.print("=========================\n");
+    report.print("Syscall statistic:\n");
     for (auto nbr = 0; nbr < max_nbr; nbr++) {
         const auto str = syscall_name(nbr);
         if (str) {
@@ -164,17 +173,17 @@ int main(const int argc, char *argv[]) {
                 for (auto&[obj, func] : syscalls[nbr]) {
                     callers += fmt::format("{}@{}  ", func->name(), obj);
                 }
-                spdlog::info("{0:<3}{1:<4}{2:<25} : {3:}", yes ? "o" : "", nbr, str.value(), callers);
+                report.print("{0:<3}{1:<4}{2:<25} : {3:}\n", yes ? "o" : "", nbr, str.value(), callers);
             }
         }
     }
-    spdlog::info("=========================");
+    report.print("=========================\n");
     {
         std::string callers{};
         for (const auto& bad_call : bad_syscalls) {
             callers += bad_call + "  ";
         }
-        spdlog::info("Failed to decode system call in:");
-        spdlog::info("  {}", callers);
+        report.print("Failed to decode system call in:\n");
+        report.print("  {}", callers);
     }
 }
