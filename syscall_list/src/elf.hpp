@@ -218,7 +218,7 @@ struct ELF {
         return ret;
     }
 
-    auto parse_external_call(const auto& func, const auto& bb) -> std::optional<Dyninst::Address> {
+    auto parse_external_call(const auto& func, const auto& bb, const auto& callstack) -> std::optional<Dyninst::Address> {
         // Decode
         const auto out_addr = bb->last();
         const auto instr = bb->getInsn(bb->last());
@@ -241,7 +241,8 @@ struct ELF {
             // Create a Slicer that will start from the given assignment
             Dyninst::Slicer s(pc_assign, bb, func);
             // Slice to fund the register indirect call
-            Dyninst::Slicer::Predicates mp;
+            //Dyninst::Slicer::Predicates mp;
+            IndirectPredicates mp{callstack};
             const auto slice = s.backwardSlice(mp);
 
             // Expand the expression
@@ -255,6 +256,8 @@ struct ELF {
 
             if (visitor.resolved && visitor.target) {  // Call to Null is ambiguous
                 return visitor.target;
+            } else {
+                //slice->printDOT("123.dot");
             }
         }
 
@@ -280,7 +283,7 @@ struct ELF {
         }
     }
 
-    static void traverse_called_funcs(const auto& object, const auto& symbol, auto& func_callback, auto& syscall_callback, auto& bogus_callback, auto& bogus_syscall_callback,
+    static void traverse_called_funcs(const auto recursive, const auto& object, const auto& symbol, auto& func_callback, auto& syscall_callback, auto& bogus_callback, auto& bogus_syscall_callback,
         std::set<std::pair<std::string, Dyninst::Address>>& seen, std::deque<Dyninst::ParseAPI::Function*>& callstack) {
         auto elf = ELFCache::get().find(object);
         const auto func = [&] {
@@ -319,7 +322,7 @@ struct ELF {
         func_callback(layer, object, func);
 
         // resolve the cfg
-        elf.resolve(func);
+        elf.resolve(func, callstack);
 
         if (!elf.cfg.contains(func)) {
             return;  // Don't call anything
@@ -328,7 +331,7 @@ struct ELF {
         callstack.push_back(func);
 
         const auto next_level = [&](const auto& obj, const auto sym) {
-            traverse_called_funcs(obj, sym, func_callback, syscall_callback, bogus_callback, bogus_syscall_callback, seen, callstack);
+            traverse_called_funcs(recursive, obj, sym, func_callback, syscall_callback, bogus_callback, bogus_syscall_callback, seen, callstack);
         };
 
         if (elf.cfg[func].do_syscall) {
@@ -351,22 +354,24 @@ struct ELF {
             }
             next_level(object, callee);
         }
-        for (const auto&[out_addr, addr] : elf.cfg.at(func).dynamic) {
-            const auto isGOT = elf.GOT.contains(addr);
-            if (isGOT || elf.PLT.contains(addr)) {
-                const auto& tab = isGOT ? elf.GOT : elf.PLT;
-                const auto callee = tab.at(addr);
-                if (callee.object.starts_with("libc") && callee.symbols.contains("syscall")) {
-                    spdlog::debug("Special handing for syscall(3)");
-                    // parse the 1st register into syscall
-                    const auto syscalls = parse_syscall_func(func, out_addr, callstack);
-                    for (const auto& syscall_nbr : syscalls) {
-                        syscall_callback(layer + 1, object, func, syscall_nbr);
+        if (recursive) {
+            for (const auto&[out_addr, addr] : elf.cfg.at(func).dynamic) {
+                const auto isGOT = elf.GOT.contains(addr);
+                if (isGOT || elf.PLT.contains(addr)) {
+                    const auto& tab = isGOT ? elf.GOT : elf.PLT;
+                    const auto callee = tab.at(addr);
+                    if (callee.object.starts_with("libc") && callee.symbols.contains("syscall")) {
+                        spdlog::debug("Special handing for syscall(3)");
+                        // parse the 1st register into syscall
+                        const auto syscalls = parse_syscall_func(func, out_addr, callstack);
+                        for (const auto& syscall_nbr : syscalls) {
+                            syscall_callback(layer + 1, object, func, syscall_nbr);
+                        }
                     }
+                    next_level(callee.object, callee.symbols);
+                } else {
+                    bogus_callback(layer + 1, object, func, addr);
                 }
-                next_level(callee.object, callee.symbols);
-            } else {
-                bogus_callback(layer + 1, object, func, addr);
             }
         }
 
@@ -546,7 +551,7 @@ struct ELF {
         object->finalize();
     }
 
-    inline auto resolve(Dyninst::ParseAPI::Function* func) {
+    inline auto resolve(Dyninst::ParseAPI::Function* func, const auto& callstack) {
         for (const auto& bb : func->blocks()) {
             for (const auto& target : bb->targets()) {
                 if (target->type() == Dyninst::ParseAPI::EdgeTypeEnum::RET) {
@@ -565,7 +570,7 @@ struct ELF {
                         if(is_syscall(instr)) {
                             this->cfg[func].do_syscall = true;
                         } else {  // Not syscall
-                            const auto callee_addr = parse_external_call(func, bb);
+                            const auto callee_addr = parse_external_call(func, bb, callstack);
                             if (callee_addr) {
                                 spdlog::debug("{} @ {:x} BB target AST resolved as a edge to {:x}", name, out_addr, callee_addr.value());
                                 if (this->rela_plt_table.contains(callee_addr.value())) {
@@ -586,20 +591,20 @@ struct ELF {
         }
     }
 
-    static void traverse_called_funcs(const auto& object, const auto& symbols, auto& func_callback, auto& syscall_callback, auto& bogus_callback, auto& bogus_syscall_callback) {
+    static void traverse_called_funcs(const auto recursive, const auto& object, const auto& symbols, auto& func_callback, auto& syscall_callback, auto& bogus_callback, auto& bogus_syscall_callback) {
         std::set<std::pair<std::string, Dyninst::Address>> seen;
         for (const auto& symbol: symbols) {
             std::deque<Dyninst::ParseAPI::Function*> callstack;
-            traverse_called_funcs(object, symbol, func_callback, syscall_callback, bogus_callback, bogus_syscall_callback, seen, callstack);
+            traverse_called_funcs(recursive, object, symbol, func_callback, syscall_callback, bogus_callback, bogus_syscall_callback, seen, callstack);
         }
     }
 
-    static void traverse_called_funcs(const auto& object, auto& func_callback, auto& syscall_callback, auto& bogus_callback, auto& bogus_syscall_callback) {
+    static void traverse_called_funcs(const auto recursive, const auto& object, auto& func_callback, auto& syscall_callback, auto& bogus_callback, auto& bogus_syscall_callback) {
         std::set<std::pair<std::string, Dyninst::Address>> seen;
         const auto elf = ELFCache::get().find(object);
         for (const auto& func : elf.functions) {
             std::deque<Dyninst::ParseAPI::Function*> callstack;
-            traverse_called_funcs(object, func, func_callback, syscall_callback, bogus_callback, bogus_syscall_callback, seen, callstack);
+            traverse_called_funcs(recursive, object, func, func_callback, syscall_callback, bogus_callback, bogus_syscall_callback, seen, callstack);
         }
     }
 };

@@ -24,14 +24,47 @@ public:
     }
 };
 
+class IndirectPredicates : public Dyninst::Slicer::Predicates {
+    std::deque<Dyninst::ParseAPI::Function*> callstack;
+public:
+    IndirectPredicates(const auto& callstack_) : callstack(callstack_) {
+        callstack.pop_back();
+    }
+    virtual std::vector<Dyninst::ParseAPI::Function*> followCallBackward(Dyninst::ParseAPI::Block* caller, CallStack_t& cs, Dyninst::AbsRegion argument) {
+        if (callstack.size() >= 1) {
+            const auto target = callstack.back();
+            callstack.pop_back();
+            return std::vector{target};
+        } else {
+            return {};
+        }
+    }
+
+    virtual bool addPredecessor(Dyninst::AbsRegion reg) {
+        spdlog::debug("Predecessor {}", reg.format());
+        if (reg.absloc().type() == Dyninst::Absloc::Register) {
+            //const auto r = reg.absloc().reg();
+            //spdlog::debug("Predecessor {}", reg.format());
+        }
+        return true;
+    }
+
+    virtual bool addNodeCallback(Dyninst::AssignmentPtr assign, std::set<Dyninst::ParseAPI::Edge*> &) {
+        spdlog::debug("Add Node {}", assign->format());
+        return true;
+    }
+};
+
 class SyscallNumberPredicates : public Dyninst::Slicer::Predicates {
     std::deque<Dyninst::ParseAPI::Function*> callstack;
 public:
-    SyscallNumberPredicates(const auto& callstack_) : callstack(callstack_) {}
+    SyscallNumberPredicates(const auto& callstack_) : callstack(callstack_) {
+        callstack.pop_back();
+    }
     virtual std::vector<Dyninst::ParseAPI::Function*> followCallBackward(Dyninst::ParseAPI::Block* caller, CallStack_t& cs, Dyninst::AbsRegion argument) {
-        if (callstack.size() >= 2) {
-            callstack.pop_back();
+        if (callstack.size() >= 1) {
             const auto target = callstack.back();
+            callstack.pop_back();
             return std::vector{target};
         } else {
             return {};
