@@ -38,6 +38,7 @@
 ABSL_FLAG(bool, lib, false, "Is a shared library");
 ABSL_FLAG(std::string, entry, "main", "Entry for executable");
 ABSL_FLAG(std::string, output, "", "Report filename");
+ABSL_FLAG(bool, recursive, true, "Recursive scan");
 
 namespace ParseAPI = Dyninst::ParseAPI;
 namespace SymtabAPI = Dyninst::SymtabAPI;
@@ -133,10 +134,12 @@ int main(const int argc, char *argv[]) {
         bad_syscalls.emplace_back(fmt::format("{}@{}", func->name(), object));
     };
 
+    const auto recusrive = absl::GetFlag(FLAGS_recursive);
+
     if (islib) {
         spdlog::info("{} is an shared library, scanning all functions", filename);
 
-        ELF::traverse_called_funcs(exe_name, func_printer, syscall_printer, bogus_printer, bogus_syscall_printer);
+        ELF::traverse_called_funcs(recusrive, exe_name, func_printer, syscall_printer, bogus_printer, bogus_syscall_printer);
 
     } else {
         const auto entry_name = absl::GetFlag(FLAGS_entry);
@@ -147,7 +150,7 @@ int main(const int argc, char *argv[]) {
             entry_name
         };
 
-        ELF::traverse_called_funcs(exe_name, entries, func_printer, syscall_printer, bogus_printer, bogus_syscall_printer);
+        ELF::traverse_called_funcs(recusrive, exe_name, entries, func_printer, syscall_printer, bogus_printer, bogus_syscall_printer);
     }
 
 
