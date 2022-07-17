@@ -15,6 +15,7 @@
 #include <tuple>
 
 #include "spdlog/spdlog.h"
+#include "absl/container/btree_map.h"
 
 #include "BPatch.h"
 #include "BPatch_addressSpace.h"
@@ -79,8 +80,8 @@ struct ELFCache {
 
 struct ELF {
     std::set<Dyninst::ParseAPI::Function*> functions;
-    std::map<Dyninst::Address, Dyninst::ParseAPI::Function*> function_addr_map;
-    std::map<std::string, Dyninst::ParseAPI::Function*> function_name_map;
+    absl::btree_map<Dyninst::Address, Dyninst::ParseAPI::Function*> function_addr_map;
+    absl::btree_map<std::string, Dyninst::ParseAPI::Function*> function_name_map;
 
     struct DynamicSymbol {
         std::string object;
@@ -89,10 +90,10 @@ struct ELF {
         auto operator<=>(const DynamicSymbol&) const = default;
     };
 
-    std::map<Dyninst::Address, DynamicSymbol> GOT;
-    std::map<Dyninst::Address, DynamicSymbol> PLT;
-    std::map<std::string, Dyninst::Address> rela_dyn_table;
-    std::map<Dyninst::Address, Dyninst::Address> rela_plt_table;
+    absl::btree_map<Dyninst::Address, DynamicSymbol> GOT;
+    absl::btree_map<Dyninst::Address, DynamicSymbol> PLT;
+    absl::btree_map<std::string, Dyninst::Address> rela_dyn_table;
+    absl::btree_map<Dyninst::Address, Dyninst::Address> rela_plt_table;
 
     struct CallDest {
         std::set<std::pair<Dyninst::Address, Dyninst::ParseAPI::Function*>> static_;
@@ -100,7 +101,7 @@ struct ELF {
         bool do_syscall = false;
     };
 
-    std::map<Dyninst::ParseAPI::Function*, CallDest> cfg;
+    absl::btree_map<Dyninst::ParseAPI::Function*, CallDest> cfg;
 
     std::string name;
     std::string path;
@@ -137,7 +138,7 @@ struct ELF {
 
     static auto make_assignments(const auto& func, const auto& bb, const auto& addr, const auto& instr) {
         // Convert the instruction to assignments
-        Dyninst::AssignmentConverter ac(true, true);
+        Dyninst::AssignmentConverter ac(false, true);
         std::vector<Dyninst::Assignment::Ptr> assignments;
         ac.convert(instr, addr, func, bb, assignments);
         return assignments;
@@ -242,6 +243,7 @@ struct ELF {
             Dyninst::Slicer s(pc_assign, bb, func);
             // Slice to fund the register indirect call
             //Dyninst::Slicer::Predicates mp;
+            //(void)callstack;
             IndirectPredicates mp{callstack};
             const auto slice = s.backwardSlice(mp);
 
@@ -337,19 +339,19 @@ struct ELF {
         if (elf.cfg[func].do_syscall) {
             const auto syscalls = parse_syscall(func, callstack);
             for (const auto& syscall_nbr : syscalls) {
-                syscall_callback(layer + 1, object, func, syscall_nbr);
+                syscall_callback(layer + 1, object, func, syscall_nbr, false);
             }
             if (!syscalls.size()) {
-                bogus_syscall_callback(layer, object, func);
+                bogus_syscall_callback(layer, object, func, false);
             }
         }
         for (const auto&[out_addr, callee] : elf.cfg.at(func).static_) {
             if (object.starts_with("libc") && callee->name() == "syscall") {
-                spdlog::debug("Special handing for syscall(3)");
+                spdlog::error("Special handing for syscall(3) in libc");
                 // parse the 1st register into syscall
                 const auto syscalls = parse_syscall_func(func, out_addr, callstack);
                 for (const auto& syscall_nbr : syscalls) {
-                    syscall_callback(layer + 1, object, func, syscall_nbr);
+                    syscall_callback(layer + 1, object, func, syscall_nbr, true);
                 }
             }
             next_level(object, callee);
@@ -361,11 +363,11 @@ struct ELF {
                     const auto& tab = isGOT ? elf.GOT : elf.PLT;
                     const auto callee = tab.at(addr);
                     if (callee.object.starts_with("libc") && callee.symbols.contains("syscall")) {
-                        spdlog::debug("Special handing for syscall(3)");
+                        spdlog::error("Special handing for syscall(3) into libc");
                         // parse the 1st register into syscall
                         const auto syscalls = parse_syscall_func(func, out_addr, callstack);
                         for (const auto& syscall_nbr : syscalls) {
-                            syscall_callback(layer + 1, object, func, syscall_nbr);
+                            syscall_callback(layer + 1, object, func, syscall_nbr, true);
                         }
                     }
                     next_level(callee.object, callee.symbols);

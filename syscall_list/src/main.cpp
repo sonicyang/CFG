@@ -112,6 +112,7 @@ int main(const int argc, char *argv[]) {
     ELFCache::get().find(exe_name, exe_path);
 
     std::map<Dyninst::Address, std::vector<std::pair<std::string, Dyninst::ParseAPI::Function*>>> syscalls;
+    std::set<std::string> made_syscalls;
     std::vector<std::string> bad_syscalls;
 
     const auto func_printer = [&](const auto layer, const auto& object, const auto& func) {
@@ -120,18 +121,28 @@ int main(const int argc, char *argv[]) {
         //spdlog::info("{3: <{4}}{0} {1} {2:x}", object, func->name(), func->addr(), "", layer);
     };
 
-    const auto syscall_printer = [&](const auto layer, const auto& object, const auto& func, const auto syscall_nbr) {
+    const auto syscall_printer = [&](const auto layer, const auto& object, const auto& func, const auto syscall_nbr, const auto is_syscall) {
+        if (is_syscall) {
+            syscalls[syscall_nbr].emplace_back(std::make_pair(object + ":syscall(3)", func));
+        } else {
+            syscalls[syscall_nbr].emplace_back(std::make_pair(object, func));
+        }
+        if (!made_syscalls.contains(object)) {
+            made_syscalls.emplace(object);
+        }
         //spdlog::info("{2: <{3}} syscall {0} {1}", syscall_nbr, "", "", layer + 1);
-        syscalls[syscall_nbr].emplace_back(std::make_pair(object, func));
     };
 
     const auto bogus_printer = [](const auto layer, const auto& object, const auto& func, const auto addr) {
         //spdlog::info("{2: <{3}}Bogus call {0} {1:x}", object, addr, "", layer);
     };
 
-    const auto bogus_syscall_printer = [&](const auto layer, const auto& object, const auto& func) {
+    const auto bogus_syscall_printer = [&](const auto layer, const auto& object, const auto& func, const auto is_syscall) {
         //spdlog::info("{2: <{3}}Bogus call {0} {1:x}", object, addr, "", layer);
-        bad_syscalls.emplace_back(fmt::format("{}@{}", func->name(), object));
+        bad_syscalls.emplace_back(fmt::format("{}@{}:{}", func->name(), object, is_syscall ? "syscall(3)" : ""));
+        if (!made_syscalls.contains(object)) {
+            made_syscalls.emplace(object);
+        }
     };
 
     const auto recusrive = absl::GetFlag(FLAGS_recursive);
@@ -161,6 +172,12 @@ int main(const int argc, char *argv[]) {
 
     report.print("Scanned ELFs: ");
     for (const auto&[name, elf] : ELFCache::get().getAll()) {
+        report.print("{} ", name);
+    }
+    report.print("\n");
+
+    report.print("ELFs made syscalls: ");
+    for (const auto& name : made_syscalls) {
         report.print("{} ", name);
     }
     report.print("\n");

@@ -27,31 +27,21 @@ public:
 class IndirectPredicates : public Dyninst::Slicer::Predicates {
     std::deque<Dyninst::ParseAPI::Function*> callstack;
 public:
-    IndirectPredicates(const auto& callstack_) : callstack(callstack_) {
-        callstack.pop_back();
+    IndirectPredicates(const auto& callstack_) : callstack(callstack_) {}
+
+    /* stop at memory access, we cannot reduce it using dyninst anyway */
+    virtual bool endAtPoint(Dyninst::Assignment::Ptr ap) {
+        return ap->insn().writesMemory();
     }
+
     virtual std::vector<Dyninst::ParseAPI::Function*> followCallBackward(Dyninst::ParseAPI::Block* caller, CallStack_t& cs, Dyninst::AbsRegion argument) {
         if (callstack.size() >= 1) {
-            const auto target = callstack.back();
+            const auto target = std::vector{callstack.back()};
             callstack.pop_back();
-            return std::vector{target};
+            return target;
         } else {
             return {};
         }
-    }
-
-    virtual bool addPredecessor(Dyninst::AbsRegion reg) {
-        spdlog::debug("Predecessor {}", reg.format());
-        if (reg.absloc().type() == Dyninst::Absloc::Register) {
-            //const auto r = reg.absloc().reg();
-            //spdlog::debug("Predecessor {}", reg.format());
-        }
-        return true;
-    }
-
-    virtual bool addNodeCallback(Dyninst::AssignmentPtr assign, std::set<Dyninst::ParseAPI::Edge*> &) {
-        spdlog::debug("Add Node {}", assign->format());
-        return true;
     }
 };
 
@@ -61,11 +51,12 @@ public:
     SyscallNumberPredicates(const auto& callstack_) : callstack(callstack_) {
         callstack.pop_back();
     }
+
     virtual std::vector<Dyninst::ParseAPI::Function*> followCallBackward(Dyninst::ParseAPI::Block* caller, CallStack_t& cs, Dyninst::AbsRegion argument) {
         if (callstack.size() >= 1) {
-            const auto target = callstack.back();
+            const auto target = std::vector{callstack.back()};
             callstack.pop_back();
-            return std::vector{target};
+            return target;
         } else {
             return {};
         }
