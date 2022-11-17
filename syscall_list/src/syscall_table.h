@@ -3,10 +3,12 @@
 #include <sys/syscall.h>
 #include <string>
 #include <optional>
+#include "aarch64_syscall_table.h"
 
 #define syscode_case(x) case x: return #x
 
-static inline const char* syscall_name_(const auto nbr) {
+static inline const char* x86_64_syscall_name(const auto nbr) {
+    const auto ret = [&]() -> const char* {
     switch(nbr) {
 #ifdef SYS_FAST_atomic_update
         syscode_case(SYS_FAST_atomic_update);
@@ -1922,12 +1924,24 @@ static inline const char* syscall_name_(const auto nbr) {
         default:
             return nullptr;
     }
+    }();
+    if (ret == nullptr) {
+        return nullptr;
+    } else {
+        return ret + 4;
+    }
 }
 
-static inline auto syscall_name(const auto nbr) -> std::optional<const char*> {
-    const auto str = syscall_name_(nbr);
+static inline auto syscall_name(const auto isAArch64, const auto nbr) -> std::optional<const char*> {
+    const auto str = [&] {
+        if (isAArch64) {
+            return aarch64_syscall_name(nbr);
+        } else {
+            return x86_64_syscall_name(nbr);
+        }
+    }();
     if (str) {
-        return str + 4;
+        return str;
     } else {
         return {};
     }

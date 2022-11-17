@@ -8,6 +8,7 @@
 #include <tuple>
 #include <regex>
 #include <vector>
+#include <optional>
 
 #include <fmt/format.h>
 #include <fmt/os.h>
@@ -182,10 +183,23 @@ int main(const int argc, char *argv[]) {
     }
     report.print("\n");
 
+    // WTF boost?
+    std::optional<bool> isAArch64;
+    for (const auto& bb : syscalls.cbegin()->second.cbegin()->second->blocks()) {
+        const auto arch = bb->getInsn(bb->last()).getArch();
+        isAArch64 = arch == Dyninst::Arch_aarch64;
+        break;
+    }
+
+    if (!isAArch64.has_value()) {
+        spdlog::error("Failed determine the architecture!");
+        return -1;
+    }
+
     report.print("=========================\n");
     report.print("Syscall statistic:\n");
     for (auto nbr = 0; nbr < max_nbr; nbr++) {
-        const auto str = syscall_name(nbr);
+        const auto str = syscall_name(isAArch64.value(), nbr);
         if (str) {
             const auto yes = syscalls.contains(nbr);
             std::string callers{};
